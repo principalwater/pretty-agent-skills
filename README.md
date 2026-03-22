@@ -1,8 +1,9 @@
 # pretty-agent-skills
 
-Curated multi-agent skills for presentations and Apple iWork automation.
+Curated multi-agent skills for design, presentations, and Apple iWork automation.
 
 Current skills:
+- `visual-designer` (`skills/visual-designer`) — Create design systems, brand guidelines, and visual identities (product, brand-identity presets)
 - `presentation-designer` (`skills/presentation-designer`) — Plan and structure presentations with presets (business-pitch, academic)
 - `keynote` (`skills/keynote`) — Read, edit, create, and export Apple Keynote presentations
 - `numbers` (`skills/numbers`) — Read, edit, create, and export Apple Numbers spreadsheets
@@ -13,6 +14,7 @@ Current skills:
 Use the community installer CLI (`skills`) to install from this repo:
 
 ```bash
+npx skills add https://github.com/principalwater/pretty-agent-skills --skill visual-designer
 npx skills add https://github.com/principalwater/pretty-agent-skills --skill presentation-designer
 npx skills add https://github.com/principalwater/pretty-agent-skills --skill keynote
 npx skills add https://github.com/principalwater/pretty-agent-skills --skill numbers
@@ -50,6 +52,12 @@ npx skills add https://github.com/principalwater/pretty-agent-skills --list
 
 ```text
 skills/
+  visual-designer/
+    SKILL.md
+    LICENSE.txt
+    presets/
+      product.md
+      brand-identity.md
   presentation-designer/
     SKILL.md
     LICENSE.txt

@@ -6,6 +6,8 @@ Commands:
 - dump-text
 - replace-text
 - set-text
+- format-text
+- add-text-item
 - get-notes
 - set-notes
 - get-slide-count
@@ -13,6 +15,7 @@ Commands:
 - delete-slide
 - add-image
 - list-themes
+- list-masters
 - create
 - export
 - render-images
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +38,7 @@ from typing import Any
 @dataclass
 class SlideInfo:
     index: int
+    layout: str = ""
     text_item_count: int = 0
     text_items: list[str] = field(default_factory=list)
 
@@ -71,22 +76,48 @@ def _run_osascript(script: str) -> str:
 
 
 def _build_opening_block(in_path: Path) -> str:
-    """AppleScript block that opens a .key file and sets ``d`` to the front document."""
+    """AppleScript block that opens a .key file and sets ``d`` to the document.
+
+    Handles the case where the document is already open in Keynote by checking
+    existing documents by file path before attempting to open.
+    """
     in_path_escaped = _escape_apple_string(str(in_path.resolve()))
+    in_name = _escape_apple_string(in_path.name)
     return f'''
 set inPath to "{in_path_escaped}"
-set inAlias to (POSIX file inPath) as alias
+set inPosix to POSIX file inPath
+set inName to "{in_name}"
 
 tell application "Keynote"
-  set docsBefore to count of documents
-  open inAlias
-  set waited to 0
-  repeat while (count of documents) = docsBefore and waited < 120
-    delay 0.25
-    set waited to waited + 1
+  -- Check if document is already open by matching file name, then verify full path
+  set alreadyOpen to false
+  repeat with existingDoc in documents
+    try
+      if name of existingDoc is inName then
+        -- Verify it's the same file by checking HFS path
+        set hfsPath to file of existingDoc as text
+        set posixFromHfs to POSIX path of (hfsPath as alias)
+        if posixFromHfs is inPath then
+          set d to existingDoc
+          set alreadyOpen to true
+          exit repeat
+        end if
+      end if
+    end try
   end repeat
-  if (count of documents) = docsBefore then error "Failed to open Keynote document"
-  set d to front document
+
+  if not alreadyOpen then
+    set inAlias to inPosix as alias
+    set docsBefore to count of documents
+    open inAlias
+    set waited to 0
+    repeat while (count of documents) = docsBefore and waited < 120
+      delay 0.25
+      set waited to waited + 1
+    end repeat
+    if (count of documents) = docsBefore then error "Failed to open Keynote document"
+    set d to front document
+  end if
 '''
 
 
@@ -130,6 +161,31 @@ def _prepare_output(args: argparse.Namespace) -> Path:
     return target
 
 
+def _parse_hex_color(hex_color: str) -> tuple[int, int, int]:
+    """Convert hex color like '#FF8800' or 'FF8800' to AppleScript RGB tuple (0-65535 range)."""
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) != 6:
+        raise ValueError(f"Invalid hex color: #{hex_color}. Expected 6 hex digits.")
+    r = int(hex_color[0:2], 16) * 257  # Scale 0-255 to 0-65535
+    g = int(hex_color[2:4], 16) * 257
+    b = int(hex_color[4:6], 16) * 257
+    return (r, g, b)
+
+
+def _parse_slides_arg(slides_str: str) -> list[tuple[int, int]]:
+    """Parse slides argument like '3,6-8,11' into list of (first, last) ranges."""
+    ranges: list[tuple[int, int]] = []
+    for part in slides_str.split(","):
+        part = part.strip()
+        if "-" in part:
+            first, last = part.split("-", 1)
+            ranges.append((int(first.strip()), int(last.strip())))
+        else:
+            n = int(part)
+            ranges.append((n, n))
+    return ranges
+
+
 # ---------------------------------------------------------------------------
 # Core AppleScript operations
 # ---------------------------------------------------------------------------
@@ -144,7 +200,12 @@ def _collect_structure(in_path: Path) -> dict[str, Any]:
   repeat with i from 1 to slideCount
     set s to slide i of d
     set textCount to count of text items of s
-    set outputText to outputText & "SLIDE" & tab & i & tab & textCount & linefeed
+    try
+      set layoutName to name of base slide of s
+    on error
+      set layoutName to "(unknown)"
+    end try
+    set outputText to outputText & "SLIDE" & tab & i & tab & textCount & tab & layoutName & linefeed
 
     repeat with j from 1 to textCount
       try
@@ -157,7 +218,6 @@ def _collect_structure(in_path: Path) -> dict[str, Any]:
     end repeat
   end repeat
 
-  close d saving no
   return outputText
 end tell
 '''
@@ -175,6 +235,13 @@ end tell
         tag = parts[0]
         if tag == "SLIDES" and len(parts) >= 2:
             slide_count = int(parts[1])
+        elif tag == "SLIDE" and len(parts) >= 4:
+            idx = int(parts[1])
+            slides[idx] = SlideInfo(
+                index=idx,
+                text_item_count=int(parts[2]),
+                layout=parts[3].strip(),
+            )
         elif tag == "SLIDE" and len(parts) >= 3:
             idx = int(parts[1])
             slides[idx] = SlideInfo(index=idx, text_item_count=int(parts[2]))
@@ -189,6 +256,7 @@ end tell
         "slides": [
             {
                 "index": s.index,
+                "layout": s.layout,
                 "text_item_count": s.text_item_count,
                 "text_items": s.text_items,
             }
@@ -228,7 +296,6 @@ def _replace_text(in_path: Path, find_text: str, replace_text: str) -> int:
   end repeat
 
   save d
-  close d saving yes
   return "UPDATED" & tab & changedCount
 end tell
 '''
@@ -249,7 +316,92 @@ def _set_text(in_path: Path, slide_idx: int, item_idx: int, text: str) -> None:
         + f'''
   set object text of text item {item_idx} of slide {slide_idx} of d to "{text_escaped}"
   save d
-  close d saving yes
+  return "OK"
+end tell
+'''
+    )
+    _run_osascript(script)
+
+
+def _format_text(
+    in_path: Path,
+    slide_idx: int,
+    item_idx: int,
+    font: str | None,
+    size: int | None,
+    color: str | None,
+) -> None:
+    """Set font, size, and/or color on a text item."""
+    commands: list[str] = []
+    if font is not None:
+        font_escaped = _escape_apple_string(font)
+        commands.append(f'set the font of object text of ti to "{font_escaped}"')
+    if size is not None:
+        commands.append(f"set the size of object text of ti to {size}")
+    if color is not None:
+        r, g, b = _parse_hex_color(color)
+        commands.append(f"set the color of object text of ti to {{{r}, {g}, {b}}}")
+    if not commands:
+        return
+
+    body = "\n    ".join(commands)
+    script = (
+        _build_opening_block(in_path)
+        + f'''
+  set ti to text item {item_idx} of slide {slide_idx} of d
+  {body}
+  save d
+  return "OK"
+end tell
+'''
+    )
+    _run_osascript(script)
+
+
+def _add_text_item(
+    in_path: Path,
+    slide_idx: int,
+    text: str,
+    x: int | None,
+    y: int | None,
+    width: int | None,
+    height: int | None,
+    font: str | None,
+    size: int | None,
+    color: str | None,
+) -> None:
+    """Create a new text item on a slide with optional position, size, and formatting."""
+    text_escaped = _escape_apple_string(text)
+
+    format_commands: list[str] = []
+    if font is not None:
+        font_escaped = _escape_apple_string(font)
+        format_commands.append(f'set the font of object text of newItem to "{font_escaped}"')
+    if size is not None:
+        format_commands.append(f"set the size of object text of newItem to {size}")
+    if color is not None:
+        r, g, b = _parse_hex_color(color)
+        format_commands.append(f"set the color of object text of newItem to {{{r}, {g}, {b}}}")
+
+    format_block = "\n    ".join(format_commands) if format_commands else ""
+
+    position_block = ""
+    if x is not None and y is not None:
+        position_block += f"\n    set position of newItem to {{{x}, {y}}}"
+    if width is not None:
+        position_block += f"\n    set width of newItem to {width}"
+    if height is not None:
+        position_block += f"\n    set height of newItem to {height}"
+
+    script = (
+        _build_opening_block(in_path)
+        + f'''
+  tell slide {slide_idx} of d
+    set newItem to make new text item with properties {{object text:"{text_escaped}"}}
+    {position_block}
+    {format_block}
+  end tell
+  save d
   return "OK"
 end tell
 '''
@@ -263,7 +415,6 @@ def _get_notes(in_path: Path, slide_idx: int | None) -> list[dict[str, Any]]:
             _build_opening_block(in_path)
             + f'''
   set n to presenter notes of slide {slide_idx} of d
-  close d saving no
   return "NOTE" & tab & {slide_idx} & tab & n
 end tell
 '''
@@ -278,7 +429,6 @@ end tell
     set n to presenter notes of slide i of d
     set outputText to outputText & "NOTE" & tab & i & tab & n & linefeed
   end repeat
-  close d saving no
   return outputText
 end tell
 '''
@@ -303,7 +453,6 @@ def _set_notes(in_path: Path, slide_idx: int, text: str) -> None:
         + f'''
   set presenter notes of slide {slide_idx} of d to "{text_escaped}"
   save d
-  close d saving yes
   return "OK"
 end tell
 '''
@@ -316,7 +465,6 @@ def _get_slide_count(in_path: Path) -> int:
         _build_opening_block(in_path)
         + r'''
   set c to count of slides of d
-  close d saving no
   return c
 end tell
 '''
@@ -326,22 +474,40 @@ end tell
 
 def _add_slide(in_path: Path, position: int | None, layout: str) -> int:
     layout_escaped = _escape_apple_string(layout)
-    if position is not None:
-        pos_clause = f"at before slide {position} of d"
-    else:
-        pos_clause = "at end of slides of d"
     script = (
         _build_opening_block(in_path)
         + f'''
-  try
-    set targetLayout to first master slide of d whose name is "{layout_escaped}"
-  on error
-    set targetLayout to first master slide of d
-  end try
-  make new slide {pos_clause} with properties {{base slide:targetLayout}}
+  -- Find the target master slide by name
+  set targetLayout to missing value
+  set allMasters to master slides of d
+  repeat with ms in allMasters
+    if name of ms is "{layout_escaped}" then
+      set targetLayout to ms
+      exit repeat
+    end if
+  end repeat
+
+  if targetLayout is missing value then
+    set targetLayout to item 1 of allMasters
+  end if
+
+  -- Add slide at the end, then set its base slide
+  tell d
+    make new slide at end
+  end tell
+  set newSlide to last slide of d
+  set base slide of newSlide to targetLayout
+'''
+        + (f'''
+  -- Move to position if specified
+  set newCount to count of slides of d
+  if {position} < newCount then
+    move newSlide to before slide {position} of d
+  end if
+''' if position is not None else '')
+        + '''
   set newCount to count of slides of d
   save d
-  close d saving yes
   return newCount
 end tell
 '''
@@ -356,7 +522,6 @@ def _delete_slide(in_path: Path, slide_idx: int) -> int:
   delete slide {slide_idx} of d
   set newCount to count of slides of d
   save d
-  close d saving yes
   return newCount
 end tell
 '''
@@ -374,25 +539,25 @@ def _add_image(
     height: int | None,
 ) -> None:
     img_escaped = _escape_apple_string(str(image_path.resolve()))
-    props = f'file name:"{img_escaped}"'
-    if x is not None and y is not None:
-        props += f", position:{{{x}, {y}}}"
-    if width is not None:
-        props += f", width:{width}"
-    if height is not None:
-        props += f", height:{height}"
     script = (
         _build_opening_block(in_path)
         + f'''
+  set imgFile to POSIX file "{img_escaped}"
   tell slide {slide_idx} of d
-    make new image with properties {{{props}}}
+    set newImg to make new image with properties {{file:imgFile}}
   end tell
-  save d
-  close d saving yes
+'''
+    )
+    if x is not None and y is not None:
+        script += f"  set position of newImg to {{{x}, {y}}}\n"
+    if width is not None:
+        script += f"  set width of newImg to {width}\n"
+    if height is not None:
+        script += f"  set height of newImg to {height}\n"
+    script += '''  save d
   return "OK"
 end tell
 '''
-    )
     _run_osascript(script)
 
 
@@ -411,6 +576,34 @@ end tell
     )
     raw = _run_osascript(script)
     return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
+def _list_masters(in_path: Path) -> list[dict[str, Any]]:
+    """List all master slides (layouts) available in a document."""
+    script = (
+        _build_opening_block(in_path)
+        + r'''
+  set allMasters to master slides of d
+  set outputText to ""
+  set idx to 1
+  repeat with ms in allMasters
+    set msName to name of ms
+    set outputText to outputText & "MASTER" & tab & idx & tab & msName & linefeed
+    set idx to idx + 1
+  end repeat
+  return outputText
+end tell
+'''
+    )
+    raw = _run_osascript(script)
+    results: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[0] == "MASTER":
+            results.append({"index": int(parts[1]), "name": parts[2].strip()})
+    return results
 
 
 def _create_document(output_path: Path, theme: str) -> None:
@@ -452,7 +645,6 @@ def _export(in_path: Path, pptx_path: Path | None, pdf_path: Path | None) -> Non
     export d to POSIX file pdfOut as PDF
   end if
 
-  close d saving no
   return "OK"
 end tell
 '''
@@ -473,7 +665,8 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
     print(f"Slides: {data['slide_count']}")
     for slide in data["slides"]:
-        print(f"Slide {slide['index']}: text_items={slide['text_item_count']}")
+        layout_info = f" [{slide['layout']}]" if slide.get("layout") else ""
+        print(f"Slide {slide['index']}{layout_info}: text_items={slide['text_item_count']}")
     return 0
 
 
@@ -483,7 +676,8 @@ def cmd_dump_text(args: argparse.Namespace) -> int:
     for slide in data["slides"]:
         if slide["index"] > max_slides:
             break
-        print(f"\n# Slide {slide['index']}")
+        layout_info = f" [{slide['layout']}]" if slide.get("layout") else ""
+        print(f"\n# Slide {slide['index']}{layout_info}")
         if not slide["text_items"]:
             print("(no text items)")
             continue
@@ -505,6 +699,33 @@ def cmd_set_text(args: argparse.Namespace) -> int:
     target = _prepare_output(args)
     _set_text(target, args.slide, args.item, args.text)
     print(f"Set text of slide {args.slide}, item {args.item}")
+    print(f"Target file: {target}")
+    return 0
+
+
+def cmd_format_text(args: argparse.Namespace) -> int:
+    target = _prepare_output(args)
+    _format_text(target, args.slide, args.item, args.font, args.size, args.color)
+    parts = []
+    if args.font:
+        parts.append(f"font={args.font}")
+    if args.size:
+        parts.append(f"size={args.size}")
+    if args.color:
+        parts.append(f"color={args.color}")
+    print(f"Formatted slide {args.slide}, item {args.item}: {', '.join(parts)}")
+    print(f"Target file: {target}")
+    return 0
+
+
+def cmd_add_text_item(args: argparse.Namespace) -> int:
+    target = _prepare_output(args)
+    _add_text_item(
+        target, args.slide, args.text,
+        args.x, args.y, args.width, args.height,
+        args.font, args.size, args.color,
+    )
+    print(f"Text item added to slide {args.slide}")
     print(f"Target file: {target}")
     return 0
 
@@ -574,6 +795,16 @@ def cmd_list_themes(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_list_masters(args: argparse.Namespace) -> int:
+    masters = _list_masters(args.input)
+    if args.json:
+        print(json.dumps({"masters": masters}, ensure_ascii=False, indent=2))
+    else:
+        for m in masters:
+            print(f"{m['index']}: {m['name']}")
+    return 0
+
+
 def cmd_create(args: argparse.Namespace) -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     _create_document(args.output, args.theme)
@@ -610,14 +841,31 @@ def cmd_render_images(args: argparse.Namespace) -> int:
         pdf_path = Path(tmp) / "render.pdf"
         _export(args.input, None, pdf_path)
         prefix = out_dir / "slide"
-        proc = subprocess.run(
-            [pdftoppm, "-jpeg", "-r", str(args.dpi), str(pdf_path), str(prefix)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip() or "pdftoppm failed")
+
+        if args.slides:
+            # Selective rendering: render only specified slides
+            ranges = _parse_slides_arg(args.slides)
+            for first, last in ranges:
+                proc = subprocess.run(
+                    [pdftoppm, "-jpeg", "-r", str(args.dpi),
+                     "-f", str(first), "-l", str(last),
+                     str(pdf_path), str(prefix)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(proc.stderr.strip() or "pdftoppm failed")
+        else:
+            # Render all slides
+            proc = subprocess.run(
+                [pdftoppm, "-jpeg", "-r", str(args.dpi), str(pdf_path), str(prefix)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip() or "pdftoppm failed")
 
     print(f"Rendered images into: {out_dir}")
     return 0
@@ -632,7 +880,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # --- inspect ---
-    p_inspect = sub.add_parser("inspect", help="Inspect slide structure")
+    p_inspect = sub.add_parser("inspect", help="Inspect slide structure and layouts")
     p_inspect.add_argument("input", type=Path, help="Path to .key file")
     p_inspect.add_argument("--json", action="store_true", help="Print JSON output")
     p_inspect.set_defaults(func=cmd_inspect)
@@ -659,6 +907,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_set_text.add_argument("--text", required=True, help="New text content")
     p_set_text.add_argument("--output", type=Path, help="Optional output .key file (copy + edit)")
     p_set_text.set_defaults(func=cmd_set_text)
+
+    # --- format-text ---
+    p_format = sub.add_parser("format-text", help="Set font, size, and/or color of a text item")
+    p_format.add_argument("input", type=Path, help="Path to .key file")
+    p_format.add_argument("--slide", type=int, required=True, help="Slide index (1-based)")
+    p_format.add_argument("--item", type=int, required=True, help="Text item index (1-based)")
+    p_format.add_argument("--font", default=None, help="Font name (e.g. 'Menlo', 'Helvetica Neue')")
+    p_format.add_argument("--size", type=int, default=None, help="Font size in points")
+    p_format.add_argument("--color", default=None, help="Hex color (e.g. '#FFFFFF', 'FF8800')")
+    p_format.add_argument("--output", type=Path, help="Optional output .key file (copy + edit)")
+    p_format.set_defaults(func=cmd_format_text)
+
+    # --- add-text-item ---
+    p_add_text = sub.add_parser("add-text-item", help="Create a new text box on a slide")
+    p_add_text.add_argument("input", type=Path, help="Path to .key file")
+    p_add_text.add_argument("--slide", type=int, required=True, help="Slide index (1-based)")
+    p_add_text.add_argument("--text", required=True, help="Text content")
+    p_add_text.add_argument("--x", type=int, default=None, help="X position in points")
+    p_add_text.add_argument("--y", type=int, default=None, help="Y position in points")
+    p_add_text.add_argument("--width", type=int, default=None, help="Width in points")
+    p_add_text.add_argument("--height", type=int, default=None, help="Height in points")
+    p_add_text.add_argument("--font", default=None, help="Font name")
+    p_add_text.add_argument("--size", type=int, default=None, help="Font size in points")
+    p_add_text.add_argument("--color", default=None, help="Hex color (e.g. '#FFFFFF')")
+    p_add_text.add_argument("--output", type=Path, help="Optional output .key file (copy + edit)")
+    p_add_text.set_defaults(func=cmd_add_text_item)
 
     # --- get-notes ---
     p_get_notes = sub.add_parser("get-notes", help="Read presenter notes")
@@ -713,6 +987,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_themes.add_argument("--json", action="store_true", help="Print JSON output")
     p_themes.set_defaults(func=cmd_list_themes)
 
+    # --- list-masters ---
+    p_masters = sub.add_parser("list-masters", help="List master slide layouts in a document")
+    p_masters.add_argument("input", type=Path, help="Path to .key file")
+    p_masters.add_argument("--json", action="store_true", help="Print JSON output")
+    p_masters.set_defaults(func=cmd_list_masters)
+
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new Keynote document")
     p_create.add_argument("--output", type=Path, required=True, help="Output .key file path")
@@ -731,6 +1011,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_render.add_argument("input", type=Path, help="Path to .key file")
     p_render.add_argument("--out-dir", type=Path, required=True, help="Output directory for JPEG images")
     p_render.add_argument("--dpi", type=int, default=150, help="Render DPI (default: 150)")
+    p_render.add_argument("--slides", default=None, help="Render specific slides (e.g. '3,6-8,11')")
     p_render.set_defaults(func=cmd_render_images)
 
     return parser

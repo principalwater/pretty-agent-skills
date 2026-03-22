@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pages"
+  short_description: "Work with Apple Pages .pages documents"
+  default_prompt: "Use pages skill to read, edit, and export Apple Pages files."

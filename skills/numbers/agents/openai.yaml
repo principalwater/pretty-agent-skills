@@ -1,0 +1,4 @@
+interface:
+  display_name: "Numbers"
+  short_description: "Work with Apple Numbers .numbers spreadsheets"
+  default_prompt: "Use numbers skill to read, edit, and export Apple Numbers files."

@@ -10,9 +10,15 @@ license: MIT. LICENSE.txt has complete terms
 
 | Task | Guide |
 |------|-------|
-| Read/analyze a `.key` deck | `python scripts/keynote_tool.py inspect presentation.key --json` |
+| Read / analyze a `.key` deck | `python scripts/keynote_tool.py inspect presentation.key --json` |
+| Dump text by slide | `python scripts/keynote_tool.py dump-text presentation.key` |
+| Get slide count | `python scripts/keynote_tool.py get-slide-count presentation.key` |
+| Read presenter notes | `python scripts/keynote_tool.py get-notes presentation.key --json` |
 | Edit existing Keynote deck | Read [editing.md](editing.md) |
 | Create deck from scratch | Read [keynotegen.md](keynotegen.md) |
+| List available themes | `python scripts/keynote_tool.py list-themes` |
+| Export to PPTX / PDF | `python scripts/keynote_tool.py export presentation.key --pptx out.pptx --pdf out.pdf` |
+| Render slide images | `python scripts/keynote_tool.py render-images presentation.key --out-dir rendered` |
 
 ---
 
@@ -25,6 +31,13 @@ python scripts/keynote_tool.py inspect presentation.key --json
 # Dump text grouped by slide
 python scripts/keynote_tool.py dump-text presentation.key
 
+# Quick slide count
+python scripts/keynote_tool.py get-slide-count presentation.key
+
+# Read presenter notes (all slides or specific)
+python scripts/keynote_tool.py get-notes presentation.key --json
+python scripts/keynote_tool.py get-notes presentation.key --slide 3
+
 # Export for downstream tooling
 python scripts/keynote_tool.py export presentation.key --pptx output.pptx --pdf output.pdf
 ```
@@ -36,7 +49,7 @@ python scripts/keynote_tool.py export presentation.key --pptx output.pptx --pdf 
 **Read [editing.md](editing.md) for full details.**
 
 1. Inspect slide structure with `inspect` and `dump-text`.
-2. Apply targeted edits with `replace-text` (prefer writing to `--output`).
+2. Apply targeted edits with `replace-text`, `set-text`, or structural commands.
 3. Export to `.pdf`/`.pptx` and run visual/content QA.
 
 ---
@@ -49,6 +62,56 @@ Use when no template deck exists or when a new native `.key` deck is required.
 
 ---
 
+## Command Reference
+
+| Command | Purpose |
+|---------|---------|
+| `inspect` | Slide count and text-item inventory |
+| `dump-text` | Human-readable text by slide |
+| `get-slide-count` | Quick slide count |
+| `get-notes` | Read presenter notes |
+| `set-notes` | Write presenter notes |
+| `replace-text` | Find/replace text across all text items |
+| `set-text` | Set text of a specific text item on a specific slide |
+| `add-slide` | Add a new slide (optional position and layout) |
+| `delete-slide` | Delete a slide by index |
+| `add-image` | Insert an image on a slide with optional position/size |
+| `list-themes` | List available Keynote themes |
+| `create` | Create a new empty Keynote document |
+| `export` | Export `.key` to `.pptx` and/or `.pdf` |
+| `render-images` | Slide JPEG rendering for QA |
+
+---
+
+## Design Guidelines
+
+### Color Strategy
+
+- Use 2-3 accent colors plus a neutral background.
+- Pick colors from the Keynote theme palette for consistency.
+- Ensure sufficient contrast between text and background (4.5:1 minimum).
+
+### Typography
+
+| Element | Font Size | Weight |
+|---------|-----------|--------|
+| Slide title | 36-44 pt | Bold |
+| Section header | 28-32 pt | Bold |
+| Body text | 18-24 pt | Regular |
+| Captions / footnotes | 12-14 pt | Regular or Light |
+
+- Limit each slide to 2 font families maximum.
+- Use the theme's default fonts unless there is a specific reason to override.
+
+### Layout
+
+- Keep a 40-60 pt margin from all slide edges.
+- Align elements to a consistent grid.
+- Place one key idea per slide; avoid visual clutter.
+- Use visual elements (images, shapes, charts) on most slides to maintain engagement.
+
+---
+
 ## QA (Required)
 
 - Always export edited deck to `.pdf` and/or `.pptx`.
@@ -56,17 +119,10 @@ Use when no template deck exists or when a new native `.key` deck is required.
 - Render slide images and inspect overlap, clipping, and spacing.
 
 ```bash
-# Render slide images from .key
 python scripts/keynote_tool.py render-images presentation.key --out-dir rendered
 ```
 
-## Converting To Images
-
-`render-images` exports temporary PDF then runs `pdftoppm`.
-
-```bash
-python scripts/keynote_tool.py render-images presentation.key --out-dir slides --dpi 150
-```
+---
 
 ## Limitations
 

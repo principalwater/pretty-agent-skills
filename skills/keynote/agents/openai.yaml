@@ -1,0 +1,4 @@
+interface:
+  display_name: "Keynote"
+  short_description: "Work with Apple Keynote .key presentations"
+  default_prompt: "Use keynote skill to read, edit, and export Apple Keynote files."

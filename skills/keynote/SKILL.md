@@ -15,7 +15,7 @@ license: MIT. LICENSE.txt has complete terms
 | Get slide count | `python scripts/keynote_tool.py get-slide-count presentation.key` |
 | Read presenter notes | `python scripts/keynote_tool.py get-notes presentation.key --json` |
 | Edit existing Keynote deck | Read [editing.md](editing.md) |
-| Create deck from scratch | Read [keynotegen.md](keynotegen.md) |
+| Create deck from scratch | Read [creation.md](creation.md) |
 | List available themes | `python scripts/keynote_tool.py list-themes` |
 | Export to PPTX / PDF | `python scripts/keynote_tool.py export presentation.key --pptx out.pptx --pdf out.pdf` |
 | Render slide images | `python scripts/keynote_tool.py render-images presentation.key --out-dir rendered` |
@@ -56,7 +56,7 @@ python scripts/keynote_tool.py export presentation.key --pptx output.pptx --pdf 
 
 ## Creating From Scratch
 
-**Read [keynotegen.md](keynotegen.md) for full details.**
+**Read [creation.md](creation.md) for full details.**
 
 Use when no template deck exists or when a new native `.key` deck is required.
 

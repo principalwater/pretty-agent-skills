@@ -77,22 +77,43 @@ def _run_osascript(script: str) -> str:
 
 
 def _build_opening_block(in_path: Path) -> str:
-    """AppleScript block that opens a .numbers file and sets ``d`` to the front document."""
+    """AppleScript block that opens a .numbers file and sets ``d`` to the front document.
+
+    Handles already-open documents by checking name + POSIX path before attempting open.
+    """
     in_path_escaped = _escape_apple_string(str(in_path.resolve()))
+    in_name = _escape_apple_string(in_path.name)
     return f'''
 set inPath to "{in_path_escaped}"
+set inName to "{in_name}"
 set inAlias to (POSIX file inPath) as alias
 
 tell application "Numbers"
-  set docsBefore to count of documents
-  open inAlias
-  set waited to 0
-  repeat while (count of documents) = docsBefore and waited < 120
-    delay 0.25
-    set waited to waited + 1
+  set alreadyOpen to false
+  repeat with existingDoc in documents
+    try
+      if name of existingDoc is inName then
+        set hfsPath to file of existingDoc as text
+        set posixFromHfs to POSIX path of (hfsPath as alias)
+        if posixFromHfs is inPath then
+          set d to existingDoc
+          set alreadyOpen to true
+          exit repeat
+        end if
+      end if
+    end try
   end repeat
-  if (count of documents) = docsBefore then error "Failed to open Numbers document"
-  set d to front document
+  if not alreadyOpen then
+    set docsBefore to count of documents
+    open inAlias
+    set waited to 0
+    repeat while (count of documents) = docsBefore and waited < 120
+      delay 0.25
+      set waited to waited + 1
+    end repeat
+    if (count of documents) = docsBefore then error "Failed to open Numbers document"
+    set d to front document
+  end if
 '''
 
 

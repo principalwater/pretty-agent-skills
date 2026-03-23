@@ -21,6 +21,10 @@ license: MIT. LICENSE.txt has complete terms
 | Export to PPTX / PDF | `python scripts/keynote_tool.py export presentation.key --pptx out.pptx --pdf out.pdf` |
 | Render slide images | `python scripts/keynote_tool.py render-images presentation.key --out-dir rendered` |
 | Render specific slides | `python scripts/keynote_tool.py render-images presentation.key --out-dir rendered --slides 3,6-8` |
+| Add a shape | `python scripts/keynote_tool.py add-shape presentation.key --slide 4 --text "Kafka" --x 100 --y 200 --width 300 --height 55` |
+| Delete shape(s) | `python scripts/keynote_tool.py delete-shape presentation.key --slide 4 --shape 1` or `--all` |
+| Delete image(s) | `python scripts/keynote_tool.py delete-image presentation.key --slide 6 --all` |
+| Style a shape | `python scripts/keynote_tool.py style-shape presentation.key --slide 4 --shape 1 --fill "#EE7F01" --border "#000000"` |
 
 ---
 
@@ -88,6 +92,10 @@ For **template-based** workflows (corporate templates), see the template section
 | `list-masters` | List master slide layouts in a document |
 | `create` | Create a new empty Keynote document |
 | `export` | Export `.key` to `.pptx` and/or `.pdf` |
+| `add-shape` | Create a shape (rectangle with text) on a slide |
+| `delete-shape` | Delete shape(s) from a slide |
+| `delete-image` | Delete image(s) from a slide |
+| `style-shape` | Apply fill/border color via GUI scripting (requires accessibility) |
 | `render-images` | Slide image rendering for QA (supports selective slides) |
 
 ---
@@ -146,6 +154,8 @@ python scripts/keynote_tool.py render-images presentation.key --out-dir rendered
 - Keynote automation is not truly headless; the app may still launch or briefly appear during operations.
 - Script avoids forced app focus (`activate`) to reduce UI interruption, but macOS may still surface windows.
 - Some master layouts have **linked text items** (e.g., Code layout links t1 and t3). Use `add-text-item` to create independent text boxes when needed.
+- `style-shape` uses GUI scripting via System Events and requires macOS accessibility permissions.
+- `inspect` now shows shape and image counts per slide.
 
 ## Dependencies
 

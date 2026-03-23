@@ -20,6 +20,7 @@ Plan and structure presentations before building them. This skill produces a det
 2. **Select a preset** — based on audience and objective, read the matching preset:
    - [business-pitch](presets/business-pitch.md) — executive/investor decks, Apple-style impact
    - [academic](presets/academic.md) — conference talks, research presentations, lectures
+   - [tech-talk](presets/tech-talk.md) — internal engineering meetups, tech talks, system deep-dives
 
 3. **Generate the blueprint** following the preset's structure. Output:
    - Narrative architecture (story arc, opening hook, key messages, CTA)
@@ -35,6 +36,7 @@ Plan and structure presentations before building them. This skill produces a det
 |----------------|--------|-------------------|
 | Investors, C-suite, customers | `business-pitch` | Emotional impact, minimal text, dark backgrounds, 20-30 slides |
 | Conference, academic defense, lecture | `academic` | Data-driven, structured sections, light backgrounds, 15-25 slides |
+| Engineering team, internal meetup | `tech-talk` | Technical depth, architecture diagrams, code, dark backgrounds, 10-15 slides |
 
 ## Slide Spec Format
 

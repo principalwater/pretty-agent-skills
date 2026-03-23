@@ -58,6 +58,32 @@ When editing an existing `.key` deck:
      --slide 1 --image logo.png --x 50 --y 50 --width 200
    ```
 
+## Working with Shapes
+
+```bash
+# Create a shape (rectangle with text)
+python scripts/keynote_tool.py add-shape edited.key \
+  --slide 4 --text "Kafka" --x 100 --y 200 --width 300 --height 55 \
+  --font "Helvetica Neue" --size 18 --color "#FFFFFF"
+
+# Delete a specific shape
+python scripts/keynote_tool.py delete-shape edited.key --slide 4 --shape 3
+
+# Delete all shapes from a slide
+python scripts/keynote_tool.py delete-shape edited.key --slide 4 --all
+
+# Delete images from a slide
+python scripts/keynote_tool.py delete-image edited.key --slide 6 --all
+
+# Apply fill color to a shape (GUI scripting)
+python scripts/keynote_tool.py style-shape edited.key \
+  --slide 4 --shape 1 --fill "#EE7F01"
+
+# Apply fill and border
+python scripts/keynote_tool.py style-shape edited.key \
+  --slide 4 --shape 1 --fill "#FFFFFF" --border "#EE7F01"
+```
+
 5. **Export and verify**
    ```bash
    python scripts/keynote_tool.py export edited.key --pdf edited.pdf --pptx edited.pptx
@@ -87,7 +113,18 @@ When editing an existing `.key` deck:
 | `add-image` | Insert an image on a slide |
 | `list-masters` | List master slide layouts in a document |
 | `export` | Export `.key` to `.pptx` and/or `.pdf` |
+| `add-shape` | Create a shape (rectangle with text) on a slide |
+| `delete-shape` | Delete shape(s) from a slide |
+| `delete-image` | Delete image(s) from a slide |
+| `style-shape` | Apply fill/border color via GUI scripting (requires accessibility) |
 | `render-images` | Slide JPEG rendering for QA (supports `--slides` filter) |
+
+## Building Diagrams with Native Shapes
+
+1. Create shapes with `add-shape` (position, size, text, font)
+2. Apply colors with `style-shape` (fill, border via GUI scripting)
+3. Use `inspect --json` to verify shape counts
+4. Note: `style-shape` requires Keynote to be visible and focused; don't touch mouse/keyboard during execution
 
 ## Editing Rules
 

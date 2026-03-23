@@ -115,6 +115,57 @@ tell application "Keynote"
 end tell
 ```
 
+### Creating a shape (rectangle)
+```applescript
+tell application "Keynote"
+  tell slide 4 of front document
+    set sh to make new shape with properties {object text:"Kafka", width:300, height:55}
+    set position of sh to {100, 200}
+    set font of every character of object text of sh to "Helvetica Neue"
+    set size of every character of object text of sh to 18
+    set color of every character of object text of sh to {65535, 65535, 65535}
+  end tell
+end tell
+```
+
+**Important:** Use `tell slide N of document` context for `make new shape`. A flat reference like `make new shape at slide N of d` fails with error -10000.
+
+**Text formatting:** Use `every character of object text of sh` instead of `object text of sh` to avoid -10003 errors.
+
+### Deleting shapes and images
+```applescript
+tell application "Keynote"
+  tell slide 4 of front document
+    -- Delete specific shape
+    delete shape 3
+    -- Delete all shapes (reverse order)
+    repeat with i from (count of shapes) to 1 by -1
+      delete shape i
+    end repeat
+    -- Delete all images
+    repeat with i from (count of images) to 1 by -1
+      delete image i
+    end repeat
+  end tell
+end tell
+```
+
+### GUI Scripting for Fill/Stroke Colors
+
+Keynote's `background fill type` property is **read-only** in AppleScript. The only way to set fill colors programmatically is via GUI scripting through System Events.
+
+**Prerequisites:** macOS accessibility permissions for the controlling app.
+
+**Workflow:**
+1. Activate Keynote, show the target slide
+2. Click at shape center (convert slide coords to screen coords)
+3. In Format panel: expand Fill disclosure, select "Color Fill", set color well value
+4. For border: expand Border disclosure, select "Line", set 2nd color well
+
+**Coordinate conversion:** Slide coords (1920x1080) must be mapped to screen coordinates. Query the canvas area position and size from System Events, then: `screen_x = canvas_x + slide_x * scale`.
+
+**Locale warning:** AppleScript may use locale-specific decimal separators (e.g., comma in Russian locale). Use `as integer` and non-comma delimiters (e.g., `|`) when parsing coordinate values.
+
 ### Presenter notes
 ```applescript
 -- Read
@@ -195,3 +246,6 @@ This uses `pdftoppm -f N -l N` under the hood for efficient partial rendering.
 - Theme not found: theme names are case-sensitive; use `list-themes` to discover exact names.
 - Image not inserted: use `POSIX file` reference, not a bare string path. Verify the file exists.
 - Text formatting not applied: some text items are linked to master slide placeholders. Use `add-text-item` for independent text boxes.
+- `background fill type: Can't set read-only property`: use `style-shape` command (GUI scripting) instead.
+- `-10003 Access not allowed`: use `every character of object text` for color/font formatting.
+- `-10000 AppleEvent handler failed` on `make new shape`: use `tell slide N of d ... make new shape ... end tell` context.

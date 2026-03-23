@@ -8,6 +8,10 @@ Commands:
 - set-text
 - format-text
 - add-text-item
+- add-shape
+- delete-shape
+- delete-image
+- style-shape
 - get-notes
 - set-notes
 - get-slide-count
@@ -30,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,6 +45,8 @@ class SlideInfo:
     index: int
     layout: str = ""
     text_item_count: int = 0
+    shape_count: int = 0
+    image_count: int = 0
     text_items: list[str] = field(default_factory=list)
 
 
@@ -82,7 +89,7 @@ def _build_opening_block(in_path: Path) -> str:
     existing documents by file path before attempting to open.
     """
     in_path_escaped = _escape_apple_string(str(in_path.resolve()))
-    in_name = _escape_apple_string(in_path.name)
+    in_name = _escape_apple_string(in_path.stem)
     return f'''
 set inPath to "{in_path_escaped}"
 set inPosix to POSIX file inPath
@@ -200,12 +207,14 @@ def _collect_structure(in_path: Path) -> dict[str, Any]:
   repeat with i from 1 to slideCount
     set s to slide i of d
     set textCount to count of text items of s
+    set shapeCount to count of shapes of s
+    set imageCount to count of images of s
     try
       set layoutName to name of base slide of s
     on error
       set layoutName to "(unknown)"
     end try
-    set outputText to outputText & "SLIDE" & tab & i & tab & textCount & tab & layoutName & linefeed
+    set outputText to outputText & "SLIDE" & tab & i & tab & textCount & tab & layoutName & tab & shapeCount & tab & imageCount & linefeed
 
     repeat with j from 1 to textCount
       try
@@ -237,11 +246,16 @@ end tell
             slide_count = int(parts[1])
         elif tag == "SLIDE" and len(parts) >= 4:
             idx = int(parts[1])
-            slides[idx] = SlideInfo(
+            si = SlideInfo(
                 index=idx,
                 text_item_count=int(parts[2]),
                 layout=parts[3].strip(),
             )
+            if len(parts) >= 5:
+                si.shape_count = int(parts[4])
+            if len(parts) >= 6:
+                si.image_count = int(parts[5])
+            slides[idx] = si
         elif tag == "SLIDE" and len(parts) >= 3:
             idx = int(parts[1])
             slides[idx] = SlideInfo(index=idx, text_item_count=int(parts[2]))
@@ -258,6 +272,8 @@ end tell
                 "index": s.index,
                 "layout": s.layout,
                 "text_item_count": s.text_item_count,
+                "shape_count": s.shape_count,
+                "image_count": s.image_count,
                 "text_items": s.text_items,
             }
             for s in ordered
@@ -561,6 +577,362 @@ end tell
     _run_osascript(script)
 
 
+def _add_shape(
+    in_path: Path,
+    slide_idx: int,
+    text: str,
+    x: int | None,
+    y: int | None,
+    width: int | None,
+    height: int | None,
+    font: str | None,
+    size: int | None,
+    color: str | None,
+) -> None:
+    """Create a new shape (rectangle with text) on a slide."""
+    text_escaped = _escape_apple_string(text)
+
+    format_commands: list[str] = []
+    if font is not None:
+        font_escaped = _escape_apple_string(font)
+        format_commands.append(
+            f'set the font of every character of object text of newShape to "{font_escaped}"'
+        )
+    if size is not None:
+        format_commands.append(
+            f"set the size of every character of object text of newShape to {size}"
+        )
+    if color is not None:
+        r, g, b = _parse_hex_color(color)
+        format_commands.append(
+            f"set the color of every character of object text of newShape to {{{r}, {g}, {b}}}"
+        )
+
+    format_block = "\n    ".join(format_commands) if format_commands else ""
+
+    props = f'object text:"{text_escaped}"'
+    if width is not None:
+        props += f", width:{width}"
+    if height is not None:
+        props += f", height:{height}"
+
+    position_block = ""
+    if x is not None and y is not None:
+        position_block = f"\n    set position of newShape to {{{x}, {y}}}"
+
+    script = (
+        _build_opening_block(in_path)
+        + f'''
+  tell slide {slide_idx} of d
+    set newShape to make new shape with properties {{{props}}}
+    {position_block}
+    {format_block}
+  end tell
+  save d
+  return "OK"
+end tell
+'''
+    )
+    _run_osascript(script)
+
+
+def _delete_shape(in_path: Path, slide_idx: int, shape_idx: int | None) -> int:
+    """Delete a shape by index, or all shapes if shape_idx is None. Returns count deleted."""
+    if shape_idx is not None:
+        script = (
+            _build_opening_block(in_path)
+            + f'''
+  delete shape {shape_idx} of slide {slide_idx} of d
+  save d
+  return "1"
+end tell
+'''
+        )
+        _run_osascript(script)
+        return 1
+    else:
+        # Delete all shapes (in reverse order)
+        script = (
+            _build_opening_block(in_path)
+            + f'''
+  set s to slide {slide_idx} of d
+  set sc to count of shapes of s
+  repeat with i from sc to 1 by -1
+    delete shape i of s
+  end repeat
+  save d
+  return sc as text
+end tell
+'''
+        )
+        raw = _run_osascript(script)
+        return int(raw) if raw else 0
+
+
+def _delete_image(in_path: Path, slide_idx: int, image_idx: int | None) -> int:
+    """Delete an image by index, or all images if image_idx is None. Returns count deleted."""
+    if image_idx is not None:
+        script = (
+            _build_opening_block(in_path)
+            + f'''
+  delete image {image_idx} of slide {slide_idx} of d
+  save d
+  return "1"
+end tell
+'''
+        )
+        _run_osascript(script)
+        return 1
+    else:
+        script = (
+            _build_opening_block(in_path)
+            + f'''
+  set s to slide {slide_idx} of d
+  set ic to count of images of s
+  repeat with i from ic to 1 by -1
+    delete image i of s
+  end repeat
+  save d
+  return ic as text
+end tell
+'''
+        )
+        raw = _run_osascript(script)
+        return int(raw) if raw else 0
+
+
+def _style_shape(
+    in_path: Path,
+    slide_idx: int,
+    shape_idx: int,
+    fill: str | None,
+    border: str | None,
+) -> None:
+    """Apply fill and/or border color to a shape via GUI scripting (System Events).
+
+    This uses accessibility APIs because Keynote's AppleScript `background fill type`
+    is read-only. Requires accessibility permissions for System Events.
+    """
+    # Get shape center coordinates
+    coord_script = (
+        _build_opening_block(in_path)
+        + f'''
+  tell slide {slide_idx} of d
+    set sh to shape {shape_idx}
+    set p to position of sh
+    set w to width of sh
+    set h to height of sh
+    set cx to ((item 1 of p) + w / 2) as integer
+    set cy to ((item 2 of p) + h / 2) as integer
+    return (cx as text) & "|" & (cy as text)
+  end tell
+end tell
+'''
+    )
+    raw = _run_osascript(coord_script)
+    sx, sy = [int(x) for x in raw.split("|")]
+
+    # Activate Keynote and show the slide
+    show_script = f'''
+tell application "Keynote"
+  activate
+  tell document 1
+    show slide {slide_idx}
+  end tell
+end tell
+'''
+    _run_osascript(show_script)
+    time.sleep(0.5)
+
+    # Get canvas mapping from Keynote window
+    # Canvas position and scale depend on the window size; we query it dynamically
+    click_script = f'''
+tell application "System Events"
+  tell process "Keynote"
+    set w to window 1
+    set wPos to position of w
+    set wSize to size of w
+
+    -- Find the main canvas area (the slide editing area)
+    -- The canvas is typically within the scroll area
+    set canvasArea to missing value
+    try
+      set scrollAreas to every scroll area of w
+      repeat with sa in scrollAreas
+        set saSize to size of sa
+        -- The main canvas is the largest scroll area
+        if item 1 of saSize > 400 then
+          set canvasArea to sa
+          exit repeat
+        end if
+      end repeat
+    end try
+
+    if canvasArea is not missing value then
+      set cPos to position of canvasArea
+      set cSize to size of canvasArea
+      -- Scale: canvas pixels / slide points (1920 wide)
+      set scaleX to (item 1 of cSize) / 1920.0
+      set scaleY to (item 2 of cSize) / 1080.0
+      set scrX to ((item 1 of cPos) + {sx} * scaleX) as integer
+      set scrY to ((item 2 of cPos) + {sy} * scaleY) as integer
+    else
+      -- Fallback: use window-based estimate
+      set scrX to ((item 1 of wPos) + 319 + {sx} * 0.4583) as integer
+      set scrY to ((item 2 of wPos) + 165 + {sy} * 0.4583) as integer
+    end if
+
+    click at {{scrX, scrY}}
+    delay 0.4
+    return (scrX as text) & "|" & (scrY as text)
+  end tell
+end tell
+'''
+    _run_osascript(click_script)
+
+    # Apply fill
+    if fill is not None:
+        fr, fg, fb = _parse_hex_color(fill)
+        fill_script = f'''
+tell application "System Events"
+  tell process "Keynote"
+    -- Ensure Format tab is active
+    try
+      click radio button 1 of radio group 1 of window 1
+    end try
+    delay 0.3
+
+    set allElems to entire contents of window 1
+
+    -- Find Fill disclosure and expand
+    repeat with j from 1 to count of allElems
+      try
+        set e to item j of allElems
+        if role of e is "AXStaticText" and value of e is "Fill" then
+          set dt to item (j - 1) of allElems
+          if (value of dt) is 0 then
+            click dt
+            delay 0.5
+            set allElems to entire contents of window 1
+          end if
+          exit repeat
+        end if
+      end try
+    end repeat
+
+    -- Find fill popup and set to Color Fill
+    set foundFill to false
+    repeat with j from 1 to count of allElems
+      try
+        set e to item j of allElems
+        if role of e is "AXStaticText" and value of e is "Fill" then
+          set foundFill to true
+        end if
+        if foundFill and role of e is "AXPopUpButton" then
+          if value of e is not "Color Fill" then
+            click e
+            delay 0.5
+            click menu item "Color Fill" of menu 1 of e
+            delay 0.5
+            set allElems to entire contents of window 1
+          end if
+          exit repeat
+        end if
+      end try
+    end repeat
+
+    -- Find first color well and set color
+    repeat with j from 1 to count of allElems
+      try
+        set e to item j of allElems
+        if role of e is "AXColorWell" then
+          set value of e to {{{fr}, {fg}, {fb}}}
+          exit repeat
+        end if
+      end try
+    end repeat
+    delay 0.2
+  end tell
+end tell
+'''
+        _run_osascript(fill_script)
+
+    # Apply border
+    if border is not None:
+        br, bg, bb = _parse_hex_color(border)
+        border_script = f'''
+tell application "System Events"
+  tell process "Keynote"
+    set allElems to entire contents of window 1
+
+    -- Find Border section and expand
+    repeat with j from 1 to count of allElems
+      try
+        set e to item j of allElems
+        if role of e is "AXStaticText" and value of e is "Border" then
+          set dt to item (j - 1) of allElems
+          if (value of dt) is 0 then
+            click dt
+            delay 0.5
+            set allElems to entire contents of window 1
+          end if
+          exit repeat
+        end if
+      end try
+    end repeat
+
+    -- Find border popup and set to Line
+    set foundBorderLabel to false
+    repeat with j from 1 to count of allElems
+      try
+        set e to item j of allElems
+        if role of e is "AXStaticText" and value of e is "Border" then
+          set foundBorderLabel to true
+        end if
+        if foundBorderLabel and role of e is "AXPopUpButton" then
+          if value of e is not "Line" then
+            click e
+            delay 0.5
+            click menu item "Line" of menu 1 of e
+            delay 0.5
+          end if
+          exit repeat
+        end if
+      end try
+    end repeat
+
+    -- Set border color (second color well)
+    set allElems to entire contents of window 1
+    set cwIdx to 0
+    repeat with j from 1 to count of allElems
+      try
+        set e to item j of allElems
+        if role of e is "AXColorWell" then
+          set cwIdx to cwIdx + 1
+          if cwIdx is 2 then
+            set value of e to {{{br}, {bg}, {bb}}}
+            exit repeat
+          end if
+        end if
+      end try
+    end repeat
+    delay 0.2
+  end tell
+end tell
+'''
+        _run_osascript(border_script)
+
+    # Click away to deselect
+    _run_osascript('''
+tell application "System Events"
+  tell process "Keynote"
+    click at {50, 50}
+    delay 0.2
+  end tell
+end tell
+''')
+
+
 def _list_themes() -> list[str]:
     script = (
         _build_app_only_block()
@@ -666,7 +1038,13 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     print(f"Slides: {data['slide_count']}")
     for slide in data["slides"]:
         layout_info = f" [{slide['layout']}]" if slide.get("layout") else ""
-        print(f"Slide {slide['index']}{layout_info}: text_items={slide['text_item_count']}")
+        extras = []
+        extras.append(f"text_items={slide['text_item_count']}")
+        if slide.get("shape_count"):
+            extras.append(f"shapes={slide['shape_count']}")
+        if slide.get("image_count"):
+            extras.append(f"images={slide['image_count']}")
+        print(f"Slide {slide['index']}{layout_info}: {', '.join(extras)}")
     return 0
 
 
@@ -782,6 +1160,47 @@ def cmd_add_image(args: argparse.Namespace) -> int:
     _add_image(target, args.slide, args.image, args.x, args.y, args.width, args.height)
     print(f"Image added to slide {args.slide}")
     print(f"Target file: {target}")
+    return 0
+
+
+def cmd_add_shape(args: argparse.Namespace) -> int:
+    target = _prepare_output(args)
+    _add_shape(
+        target, args.slide, args.text,
+        args.x, args.y, args.width, args.height,
+        args.font, args.size, args.color,
+    )
+    print(f"Shape added to slide {args.slide}")
+    print(f"Target file: {target}")
+    return 0
+
+
+def cmd_delete_shape(args: argparse.Namespace) -> int:
+    target = _prepare_output(args)
+    shape_idx = args.shape if not args.all else None
+    deleted = _delete_shape(target, args.slide, shape_idx)
+    print(f"Deleted {deleted} shape(s) from slide {args.slide}")
+    print(f"Target file: {target}")
+    return 0
+
+
+def cmd_delete_image(args: argparse.Namespace) -> int:
+    target = _prepare_output(args)
+    image_idx = args.image if not args.all else None
+    deleted = _delete_image(target, args.slide, image_idx)
+    print(f"Deleted {deleted} image(s) from slide {args.slide}")
+    print(f"Target file: {target}")
+    return 0
+
+
+def cmd_style_shape(args: argparse.Namespace) -> int:
+    _style_shape(args.input, args.slide, args.shape, args.fill, args.border)
+    parts = []
+    if args.fill:
+        parts.append(f"fill={args.fill}")
+    if args.border:
+        parts.append(f"border={args.border}")
+    print(f"Styled shape {args.shape} on slide {args.slide}: {', '.join(parts)}")
     return 0
 
 
@@ -933,6 +1352,50 @@ def build_parser() -> argparse.ArgumentParser:
     p_add_text.add_argument("--color", default=None, help="Hex color (e.g. '#FFFFFF')")
     p_add_text.add_argument("--output", type=Path, help="Optional output .key file (copy + edit)")
     p_add_text.set_defaults(func=cmd_add_text_item)
+
+    # --- add-shape ---
+    p_add_shape = sub.add_parser("add-shape", help="Create a new shape (rectangle with text) on a slide")
+    p_add_shape.add_argument("input", type=Path, help="Path to .key file")
+    p_add_shape.add_argument("--slide", type=int, required=True, help="Slide index (1-based)")
+    p_add_shape.add_argument("--text", required=True, help="Text content")
+    p_add_shape.add_argument("--x", type=int, default=None, help="X position in points")
+    p_add_shape.add_argument("--y", type=int, default=None, help="Y position in points")
+    p_add_shape.add_argument("--width", type=int, default=None, help="Width in points")
+    p_add_shape.add_argument("--height", type=int, default=None, help="Height in points")
+    p_add_shape.add_argument("--font", default=None, help="Font name")
+    p_add_shape.add_argument("--size", type=int, default=None, help="Font size in points")
+    p_add_shape.add_argument("--color", default=None, help="Text color as hex (e.g. '#FFFFFF')")
+    p_add_shape.add_argument("--output", type=Path, help="Optional output .key file (copy + edit)")
+    p_add_shape.set_defaults(func=cmd_add_shape)
+
+    # --- delete-shape ---
+    p_del_shape = sub.add_parser("delete-shape", help="Delete shape(s) from a slide")
+    p_del_shape.add_argument("input", type=Path, help="Path to .key file")
+    p_del_shape.add_argument("--slide", type=int, required=True, help="Slide index (1-based)")
+    p_del_shape_group = p_del_shape.add_mutually_exclusive_group(required=True)
+    p_del_shape_group.add_argument("--shape", type=int, help="Shape index to delete (1-based)")
+    p_del_shape_group.add_argument("--all", action="store_true", help="Delete all shapes")
+    p_del_shape.add_argument("--output", type=Path, help="Optional output .key file (copy + edit)")
+    p_del_shape.set_defaults(func=cmd_delete_shape)
+
+    # --- delete-image ---
+    p_del_image = sub.add_parser("delete-image", help="Delete image(s) from a slide")
+    p_del_image.add_argument("input", type=Path, help="Path to .key file")
+    p_del_image.add_argument("--slide", type=int, required=True, help="Slide index (1-based)")
+    p_del_image_group = p_del_image.add_mutually_exclusive_group(required=True)
+    p_del_image_group.add_argument("--image", type=int, help="Image index to delete (1-based)")
+    p_del_image_group.add_argument("--all", action="store_true", help="Delete all images")
+    p_del_image.add_argument("--output", type=Path, help="Optional output .key file (copy + edit)")
+    p_del_image.set_defaults(func=cmd_delete_image)
+
+    # --- style-shape ---
+    p_style = sub.add_parser("style-shape", help="Apply fill/border color to a shape (GUI scripting)")
+    p_style.add_argument("input", type=Path, help="Path to .key file")
+    p_style.add_argument("--slide", type=int, required=True, help="Slide index (1-based)")
+    p_style.add_argument("--shape", type=int, required=True, help="Shape index (1-based)")
+    p_style.add_argument("--fill", default=None, help="Fill color as hex (e.g. '#EE7F01')")
+    p_style.add_argument("--border", default=None, help="Border color as hex (e.g. '#000000')")
+    p_style.set_defaults(func=cmd_style_shape)
 
     # --- get-notes ---
     p_get_notes = sub.add_parser("get-notes", help="Read presenter notes")

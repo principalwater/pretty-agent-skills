@@ -4,8 +4,8 @@ Curated multi-agent skills for design, presentations, and Apple iWork automation
 
 Current skills:
 - `visual-designer` (`skills/visual-designer`) — Create design systems, brand guidelines, and visual identities (product, brand-identity presets)
-- `presentation-designer` (`skills/presentation-designer`) — Plan and structure presentations with presets (business-pitch, academic)
-- `keynote` (`skills/keynote`) — Read, edit, create, and export Apple Keynote presentations
+- `presentation-designer` (`skills/presentation-designer`) — Plan and structure presentations with presets (business-pitch, academic, tech-talk)
+- `keynote` (`skills/keynote`) — Read, edit, create, and export Apple Keynote presentations (shapes, fill/border styling, images)
 - `numbers` (`skills/numbers`) — Read, edit, create, and export Apple Numbers spreadsheets
 - `pages` (`skills/pages`) — Read, edit, create, and export Apple Pages documents
 
@@ -64,6 +64,7 @@ skills/
     presets/
       business-pitch.md
       academic.md
+      tech-talk.md
   keynote/
     SKILL.md
     LICENSE.txt
@@ -108,3 +109,5 @@ All skills require:
 ## Apple App UI Behavior
 
 Native iWork automation requires the respective app (Keynote, Numbers, or Pages), so macOS may launch the app during operations. The scripts avoid forced app focus (`activate`), but a fully headless workflow is not guaranteed by Apple automation APIs.
+
+The Keynote `style-shape` command uses GUI scripting via System Events to set fill/border colors (AppleScript's `background fill type` is read-only). This requires macOS accessibility permissions for the controlling app.

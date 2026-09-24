@@ -3,18 +3,18 @@
 set -euo pipefail
 (( $# == 2 )) || exit 2
 policy="$HOME/.config/agent-worker-router/full-access-policy"
-[[ -f $policy && ! -L $policy ]] || { print -u2 'full access локально отключён'; exit 2; }
+[[ -f $policy && ! -L $policy ]] || { print -u2 'full access is disabled locally'; exit 2; }
 case $(< "$policy") in
   allow) exit 0 ;;
   ask) ;;
-  *) print -u2 'full access локально отключён'; exit 2 ;;
+  *) print -u2 'full access is disabled locally'; exit 2 ;;
 esac
-[[ $(uname -s) == Darwin ]] || { print -u2 'full access требует macOS-диалог подтверждения'; exit 2; }
-/usr/bin/osascript - "$1" "$2" <<'APPLESCRIPT' > /dev/null || { print -u2 'full access не подтверждён человеком'; exit 2; }
+[[ $(uname -s) == Darwin ]] || { print -u2 'full access requires a macOS confirmation dialog'; exit 2; }
+/usr/bin/osascript - "$1" "$2" <<'APPLESCRIPT' > /dev/null || { print -u2 'full access was not approved'; exit 2; }
 on run argv
   set workerName to item 1 of argv
   set workDir to item 2 of argv
-  set reply to display dialog "Разрешить FULL ACCESS воркеру " & workerName & "?\n\nРабочий каталог: " & workDir & "\n\nОн сможет читать Keychain, SSH-ключи, файлы пользователя и сеть. -C не ограничивает доступ." buttons {"Отмена", "Разрешить один раз"} default button "Отмена" cancel button "Отмена" with icon caution giving up after 90
-  if (gave up of reply) or (button returned of reply is not "Разрешить один раз") then error number -128
+  set reply to display dialog "Allow FULL ACCESS for " & workerName & "?\n\nWorking directory: " & workDir & "\n\nThe worker can access Keychain, SSH keys, user files, and the network. -C does not restrict access." buttons {"Cancel", "Allow once"} default button "Cancel" cancel button "Cancel" with icon caution giving up after 90
+  if (gave up of reply) or (button returned of reply is not "Allow once") then error number -128
 end run
 APPLESCRIPT

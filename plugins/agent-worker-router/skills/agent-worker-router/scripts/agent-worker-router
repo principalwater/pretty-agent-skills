@@ -10,7 +10,7 @@ worker= dir= model= evidence= timeout=1800 access=read pro=0
 while (( $# )); do
   case $1 in
     --worker|-C|--model|--evidence|--timeout|--access)
-      (( $# >= 2 )) || die "$1 требует аргумент" 2
+      (( $# >= 2 )) || die "$1 requires an argument" 2
       case $1 in
         --worker) worker=$2 ;; -C) dir=$2 ;; --model) model=$2 ;;
         --evidence) evidence=$2 ;; --timeout) timeout=$2 ;; --access) access=$2 ;;
@@ -27,28 +27,28 @@ done
 (( $# == 1 )) || { usage >&2; exit 2; }
 brief=$1
 [[ $brief == - ]] && brief=$(cat)
-[[ -n ${brief//[[:space:]]/} ]] || die 'пустой бриф' 2
-[[ -n $dir && -d $dir ]] || die 'нужен существующий -C DIR' 2
-[[ $timeout == <1-> ]] && (( timeout <= 86400 )) || die '--timeout: 1–86400 секунд' 2
-[[ -z $model || $model =~ '^[A-Za-z0-9_.:-]+$' ]] || die 'недопустимое имя модели' 2
-[[ $access == read || $access == edit || $access == full ]] || die '--access: read, edit или full' 2
+[[ -n ${brief//[[:space:]]/} ]] || die 'empty brief' 2
+[[ -n $dir && -d $dir ]] || die 'an existing -C DIR is required' 2
+[[ $timeout == <1-> ]] && (( timeout <= 86400 )) || die '--timeout must be 1-86400 seconds' 2
+[[ -z $model || $model =~ '^[A-Za-z0-9_.:-]+$' ]] || die 'invalid model name' 2
+[[ $access == read || $access == edit || $access == full ]] || die '--access must be read, edit, or full' 2
 if [[ $access == full ]]; then
-  [[ -z $evidence ]] || die '--evidence несовместим с full access' 2
-  print -u2 -- 'agent-worker-router: FULL ACCESS: -C не ограничивает чтение/запись; воркер может читать Keychain и другие файлы пользователя'
+  [[ -z $evidence ]] || die '--evidence is incompatible with full access' 2
+  print -u2 -- 'agent-worker-router: FULL ACCESS: -C does not restrict reading or writing; the worker can access Keychain and other user files'
 fi
 dir=${dir:A}
 home_real=${HOME:A}
 if [[ $access != full ]]; then
-  [[ $dir != / && $dir != $home_real ]] || die 'слишком широкий каталог -C' 2
+  [[ $dir != / && $dir != $home_real ]] || die '-C directory is too broad' 2
   for private in "$HOME/.ssh" "$HOME/.aws" "$HOME/.gnupg" "$HOME/.config" "$HOME/.claude" "$HOME/Library/Keychains"; do
     private=${private:A}
-    [[ $dir != $private && $dir != $private/* && $private != $dir/* ]] || die 'каталог -C содержит приватные настройки' 2
+    [[ $dir != $private && $dir != $private/* && $private != $dir/* ]] || die '-C directory includes private configuration' 2
   done
 fi
 
 case $worker in
   deepseek)
-    [[ -z $model ]] || die 'для DeepSeek используйте --pro; --model не поддерживается' 2
+    [[ -z $model ]] || die 'use --pro for DeepSeek; --model is not supported' 2
     args=(-C "$dir" --timeout "$timeout")
     [[ $access != edit ]] || args=(--edit "${args[@]}")
     [[ $access != full ]] || args=(--full "${args[@]}")
@@ -56,25 +56,25 @@ case $worker in
     [[ -z $evidence ]] || args=(--evidence "$evidence" "${args[@]}")
     exec "${0:A:h}/deepseek" "${args[@]}" "$brief" ;;
   claude|codex)
-    (( ! pro )) || die '--pro относится только к DeepSeek' 2
-    [[ -z $evidence ]] || die '--evidence пока поддерживается только для DeepSeek' 2 ;;
-  *) die 'неизвестный воркер: ожидается deepseek, claude или codex' 2 ;;
+    (( ! pro )) || die '--pro is only for DeepSeek' 2
+    [[ -z $evidence ]] || die '--evidence currently supports DeepSeek only' 2 ;;
+  *) die 'unknown worker: expected deepseek, claude, or codex' 2 ;;
 esac
 
 if [[ $access == full ]]; then
-  "${0:A:h}/authorize-full" "$worker" "$dir" || die 'full access не разрешён' 2
+  "${0:A:h}/authorize-full" "$worker" "$dir" || die 'full access was not authorized' 2
 fi
 
 out=$(mktemp "${TMPDIR:-/tmp}/agent-worker-router.XXXXXX")
 cd "$dir"
 rc=0
 if [[ $worker == claude ]]; then
-  claude_bin=$(whence -p claude) || die 'не найден Claude Code CLI'
-  cli_help=$("$claude_bin" --help) || die 'не удалось проверить Claude Code CLI'
+  claude_bin=$(whence -p claude) || die 'Claude Code CLI not found'
+  cli_help=$("$claude_bin" --help) || die 'could not inspect Claude Code CLI'
   for flag in --restricted --strict-mcp-config --safe-mode --no-session-persistence --disable-slash-commands --tools --permission-mode; do
-    [[ $cli_help == *$flag* ]] || die "Claude Code CLI не поддерживает $flag"
+    [[ $cli_help == *$flag* ]] || die "Claude Code CLI does not support $flag"
   done
-  [[ $access != full || $cli_help == *--dangerously-skip-permissions* ]] || die 'Claude Code CLI не поддерживает full access'
+  [[ $access != full || $cli_help == *--dangerously-skip-permissions* ]] || die 'Claude Code CLI does not support full access'
   tools=(Read Grep Glob)
   mode=dontAsk
   [[ $access != edit ]] || { tools+=(Edit Write); mode=acceptEdits; }
@@ -100,21 +100,21 @@ if [[ $worker == claude ]]; then
       "SHELL=/bin/zsh" "TMPDIR=${TMPDIR:-/tmp}" "LANG=${LANG:-en_US.UTF-8}" TERM=dumb \
       CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 \
       "$claude_bin" "${args[@]}" > "$out" || rc=$?
-  (( rc != 142 )) || die "таймаут ${timeout} с, частичный JSON: $out" 124
-  jq -e 'type == "object" and (.result | type == "string") and ((.modelUsage // {}) | type == "object")' "$out" >/dev/null || die "нет корректного Claude JSON (код $rc): $out"
+  (( rc != 142 )) || die "timed out after ${timeout}s; partial JSON: $out" 124
+  jq -e 'type == "object" and (.result | type == "string") and ((.modelUsage // {}) | type == "object")' "$out" >/dev/null || die "invalid Claude JSON (exit $rc): $out"
   foreign=$(jq -r '.modelUsage // {} | keys[] | select(startswith("claude-") | not)' "$out")
-  [[ -z $foreign ]] || die "ответила не Claude-модель: $foreign" 3
-  (( rc == 0 )) && [[ $(jq -r '.is_error' "$out") == false ]] || die "Claude завершился с ошибкой (код $rc): $out"
-  jq -e '(.modelUsage // {} | length) > 0 and (.result | length > 0)' "$out" >/dev/null || die "пустой ответ Claude: $out"
+  [[ -z $foreign ]] || die "a non-Claude model responded: $foreign" 3
+  (( rc == 0 )) && [[ $(jq -r '.is_error' "$out") == false ]] || die "Claude failed (exit $rc): $out"
+  jq -e '(.modelUsage // {} | length) > 0 and (.result | length > 0)' "$out" >/dev/null || die "empty Claude response: $out"
   jq -r --arg f "$out" '"agent-worker-router: worker=claude models=\((.modelUsage // {}) | keys | join(",")) json=\($f)"' "$out" >&2
   jq -r '.result' "$out"
 else
-  codex_bin=$(whence -p codex) || die 'не найден Codex CLI'
-  cli_help=$("$codex_bin" exec --help) || die 'не удалось проверить Codex CLI'
+  codex_bin=$(whence -p codex) || die 'Codex CLI not found'
+  cli_help=$("$codex_bin" exec --help) || die 'could not inspect Codex CLI'
   for flag in --sandbox --ephemeral --ignore-user-config --output-last-message --json; do
-    [[ $cli_help == *$flag* ]] || die "Codex CLI не поддерживает $flag"
+    [[ $cli_help == *$flag* ]] || die "Codex CLI does not support $flag"
   done
-  [[ $access != full || $cli_help == *--dangerously-bypass-approvals-and-sandbox* ]] || die 'Codex CLI не поддерживает full access'
+  [[ $access != full || $cli_help == *--dangerously-bypass-approvals-and-sandbox* ]] || die 'Codex CLI does not support full access'
   answer=$(mktemp "${TMPDIR:-/tmp}/agent-worker-answer.XXXXXX")
   args=(exec --ephemeral --ignore-user-config --skip-git-repo-check
         --json --output-last-message "$answer" -C "$dir")
@@ -128,8 +128,8 @@ else
     env -i "HOME=$HOME" "PATH=$PATH" "USER=${USER:-}" "LOGNAME=${LOGNAME:-}" \
       "SHELL=/bin/zsh" "TMPDIR=${TMPDIR:-/tmp}" "LANG=${LANG:-en_US.UTF-8}" TERM=dumb \
       "$codex_bin" "${args[@]}" - > "$out" || rc=$?
-  (( rc != 142 )) || die "таймаут ${timeout} с, частичный JSONL: $out" 124
-  (( rc == 0 )) && [[ -s $answer ]] || die "Codex завершился без ответа (код $rc): $out" 1
+  (( rc != 142 )) || die "timed out after ${timeout}s; partial JSONL: $out" 124
+  (( rc == 0 )) && [[ -s $answer ]] || die "Codex exited without a response (exit $rc): $out" 1
   print -u2 -- "agent-worker-router: worker=codex jsonl=$out"
   cat -- "$answer"
 fi

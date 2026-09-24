@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Отдельная связка не нужна: login разблокируется вместе со входом в macOS.
+# No separate keychain is needed: login unlocks with the macOS session.
 set -euo pipefail
 umask 077
 
@@ -14,43 +14,43 @@ case ${1:-} in
     print 'usage: setup --from-clipboard | --from-keychain SERVICE ACCOUNT | --check'
     exit 0 ;;
   --check)
-    [[ -f $settings ]] || { print -u2 'setup: настройки не найдены'; exit 1; }
-    whence -p jq >/dev/null || { print -u2 'setup: не найдена команда jq'; exit 1; }
-    jq -e --arg h "$helper" '.apiKeyHelper == $h and .env.ANTHROPIC_BASE_URL == "https://api.deepseek.com/anthropic"' "$settings" >/dev/null || { print -u2 'setup: настройки DeepSeek неверны'; exit 1; }
-    key=$(/usr/bin/security find-generic-password -s "$service" -a "$account" -w "$keychain") || { print -u2 'setup: запись Keychain не найдена'; exit 1; }
-    [[ $key =~ '^sk-[A-Za-z0-9_-]{16,}$' ]] || { unset key; print -u2 'setup: в Keychain нет ключа DeepSeek'; exit 1; }
+    [[ -f $settings ]] || { print -u2 'setup: settings not found'; exit 1; }
+    whence -p jq >/dev/null || { print -u2 'setup: jq command not found'; exit 1; }
+    jq -e --arg h "$helper" '.apiKeyHelper == $h and .env.ANTHROPIC_BASE_URL == "https://api.deepseek.com/anthropic"' "$settings" >/dev/null || { print -u2 'setup: invalid DeepSeek settings'; exit 1; }
+    key=$(/usr/bin/security find-generic-password -s "$service" -a "$account" -w "$keychain") || { print -u2 'setup: Keychain item not found'; exit 1; }
+    [[ $key =~ '^sk-[A-Za-z0-9_-]{16,}$' ]] || { unset key; print -u2 'setup: DeepSeek key not found in Keychain'; exit 1; }
     unset key
-    whence -p claude >/dev/null || { print -u2 'setup: установите Claude Code CLI'; exit 1; }
-    print 'setup: конфигурация, Keychain и Claude Code готовы'
+    whence -p claude >/dev/null || { print -u2 'setup: install the Claude Code CLI'; exit 1; }
+    print 'setup: configuration, Keychain, and Claude Code are ready'
     exit 0 ;;
   --from-clipboard|--from-keychain) ;;
   *) print -u2 'usage: setup --from-clipboard | --from-keychain SERVICE ACCOUNT | --check'; exit 2 ;;
 esac
 
-[[ $(uname -s) == Darwin ]] || { print -u2 'setup: нужен macOS Keychain'; exit 1; }
+[[ $(uname -s) == Darwin ]] || { print -u2 'setup: macOS Keychain is required'; exit 1; }
 for tool in jq claude; do
-  whence -p "$tool" >/dev/null || { print -u2 "setup: не найдена команда $tool"; exit 1; }
+  whence -p "$tool" >/dev/null || { print -u2 "setup: $tool command not found"; exit 1; }
 done
-[[ -f $keychain ]] || { print -u2 'setup: login Keychain не найдена'; exit 1; }
+[[ -f $keychain ]] || { print -u2 'setup: login Keychain not found'; exit 1; }
 
 if [[ $1 == --from-clipboard ]]; then
   for tool in pbpaste pbcopy; do
-    whence -p "$tool" >/dev/null || { print -u2 "setup: не найдена команда $tool"; exit 1; }
+    whence -p "$tool" >/dev/null || { print -u2 "setup: $tool command not found"; exit 1; }
   done
   trap 'pbcopy < /dev/null' EXIT
   key=$(pbpaste)
-  source_label=буфере
+  source_label=clipboard
 else
-  (( $# == 3 )) || { print -u2 'setup: нужны SERVICE и ACCOUNT исходной записи'; exit 2; }
-  key=$(/usr/bin/security find-generic-password -s "$2" -a "$3" -w) || { print -u2 'setup: исходная запись Keychain не найдена'; exit 1; }
+  (( $# == 3 )) || { print -u2 'setup: source SERVICE and ACCOUNT are required'; exit 2; }
+  key=$(/usr/bin/security find-generic-password -s "$2" -a "$3" -w) || { print -u2 'setup: source Keychain item not found'; exit 1; }
   source_label=Keychain
 fi
-[[ $key =~ '^sk-[A-Za-z0-9_-]{16,}$' ]] || { unset key; print -u2 "setup: в $source_label не ключ DeepSeek (sk-…); ничего не записано"; exit 1; }
+[[ $key =~ '^sk-[A-Za-z0-9_-]{16,}$' ]] || { unset key; print -u2 "setup: $source_label does not contain a DeepSeek key (sk-…); nothing was written"; exit 1; }
 
-# security -i получает ключ только по stdin: ни argv, ни конфиг его не содержат.
+# security -i receives the key only on stdin; neither argv nor the config contains it.
 printf 'add-generic-password -U -a %s -s %s -T /usr/bin/security -w %s "%s"\n' "$account" "$service" "$key" "$keychain" | /usr/bin/security -i >/dev/null
-stored=$(/usr/bin/security find-generic-password -s "$service" -a "$account" -w "$keychain") || { unset key; print -u2 'setup: не удалось прочитать новую запись'; exit 1; }
-[[ $stored == $key ]] || { unset stored key; print -u2 'setup: записанный ключ не совпадает с исходным'; exit 1; }
+stored=$(/usr/bin/security find-generic-password -s "$service" -a "$account" -w "$keychain") || { unset key; print -u2 'setup: could not read the new Keychain item'; exit 1; }
+[[ $stored == $key ]] || { unset stored key; print -u2 'setup: stored key does not match the source'; exit 1; }
 unset stored
 unset key
 
@@ -65,4 +65,4 @@ fi
 jq -n --arg h "$helper" '{apiKeyHelper:$h, model:"deepseek-flash[1m]", effortLevel:"max", env:{ANTHROPIC_BASE_URL:"https://api.deepseek.com/anthropic", ANTHROPIC_DEFAULT_OPUS_MODEL:"deepseek-v4-pro", ANTHROPIC_DEFAULT_SONNET_MODEL:"deepseek-flash[1m]", ANTHROPIC_DEFAULT_HAIKU_MODEL:"deepseek-flash", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:"1"}}' > "$tmp"
 mv -- "$tmp" "$settings"
 tmp=
-print 'setup: ключ сохранён в login Keychain. Любой процесс этого пользователя, запускающий /usr/bin/security, может читать этот item без повторного запроса.'
+print 'setup: key saved in login Keychain. Any process running as this user can call /usr/bin/security to read this item without another prompt.'

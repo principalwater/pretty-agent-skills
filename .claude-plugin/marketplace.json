@@ -12,6 +12,12 @@
       "description": "Delegate bounded tasks to DeepSeek from Claude Code.",
       "source": "./plugins/deepseek-worker",
       "category": "productivity"
+    },
+    {
+      "name": "agent-worker-router",
+      "description": "Route bounded tasks to DeepSeek, Claude Code, or Codex workers.",
+      "source": "./plugins/agent-worker-router",
+      "category": "productivity"
     }
   ]
 }

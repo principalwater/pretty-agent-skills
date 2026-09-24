@@ -1,0 +1,9 @@
+{
+  "name": "agent-worker-router",
+  "version": "0.1.0",
+  "description": "Route bounded tasks to fresh DeepSeek, Claude Code, or Codex workers.",
+  "author": {
+    "name": "principalwater",
+    "url": "https://github.com/principalwater"
+  }
+}

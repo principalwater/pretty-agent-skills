@@ -1,0 +1,23 @@
+{
+  "name": "agent-worker-router",
+  "version": "0.1.0",
+  "description": "Route bounded tasks to fresh DeepSeek, Claude Code, or Codex workers.",
+  "author": {
+    "name": "principalwater",
+    "url": "https://github.com/principalwater"
+  },
+  "homepage": "https://github.com/principalwater/pretty-agent-skills",
+  "repository": "https://github.com/principalwater/pretty-agent-skills",
+  "license": "MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Worker Router",
+    "shortDescription": "Delegate to DeepSeek, Claude, or Codex",
+    "longDescription": "Launch a fresh external worker with explicit access level without changing the host default model.",
+    "developerName": "principalwater",
+    "category": "Productivity",
+    "capabilities": ["Instructions"],
+    "websiteURL": "https://github.com/principalwater/pretty-agent-skills",
+    "defaultPrompt": "Delegate a bounded, reviewed task to an explicitly selected worker."
+  }
+}

@@ -9,7 +9,31 @@ Current skills:
 - `numbers` (`skills/numbers`) — Read, edit, create, and export Apple Numbers spreadsheets
 - `pages` (`skills/pages`) — Read, edit, create, and export Apple Pages documents
 
-## DeepSeek worker plugin (Codex and Claude Code)
+## Agent worker router (Codex and Claude Code)
+
+`plugins/agent-worker-router` runs a **fresh external** DeepSeek, Claude Code, or Codex worker without changing the host's default model. It is not a native subagent. Access is explicit per call: `read` (default), `edit`, or `full`; `full` requires a separate local opt-in and exposes same-user files and Keychain. `-C` is a starting directory, **not** a privacy boundary for Codex at any access level or for any full-access worker. Codex read-only restricts writes, not reads. Never route secrets or private data across providers without reviewing what the worker can read.
+
+Requires macOS, `zsh`, `jq`, and the relevant agent CLI. DeepSeek additionally needs the user's own API key in the login Keychain. Install or update through the host marketplace:
+
+```sh
+codex plugin marketplace add principalwater/pretty-agent-skills
+codex plugin add agent-worker-router@pretty-agent-skills
+claude plugin marketplace add principalwater/pretty-agent-skills
+claude plugin install agent-worker-router@pretty-agent-skills --scope user
+```
+
+Locate the installed `agent-worker-router` skill and run its adjacent `scripts/setup --from-clipboard` after copying your own DeepSeek key locally. Setup clears the clipboard. Existing users can run `scripts/setup --from-keychain pretty-agent-deepseek-worker default`; `scripts/setup --check` verifies without printing the key. The same login Keychain item is shared with the legacy plugin, so no second credential is needed. Never paste a key into chat or command arguments.
+
+```sh
+"/absolute/installed/path/skills/agent-worker-router/scripts/agent-worker-router" \
+  --worker deepseek --access read -C /reviewed/dir 'A bounded task'
+```
+
+`--worker claude` uses your Claude Code account; `--worker codex` uses your Codex account. `--access edit` is opt-in. Full access is disabled by default and requires `--access full` plus one setup choice: `scripts/setup --full-access allow` runs without further confirmation, `scripts/setup --full-access ask` opens a macOS confirmation dialog each time, and `scripts/setup --full-access deny` disables it. With `allow`, a prompt-injected master agent could initiate a full call without asking you; use only in trusted workflows. Neither mode isolates same-user malicious code or protects the Keychain. The worker's claims and edits still need master review. No token/cost budget or OpenHavn receipt is enforced. A portable installation prompt for another Mac is in [docs/install-agent-worker-router-prompt.md](docs/install-agent-worker-router-prompt.md).
+
+For updates, use `codex plugin marketplace upgrade pretty-agent-skills` then `codex plugin add agent-worker-router@pretty-agent-skills`; for Claude Code use `claude plugin marketplace update pretty-agent-skills` then `claude plugin update agent-worker-router@pretty-agent-skills`. Restart the host or start a new session to load changed skill instructions. These commands do not imply automatic scheduled updates.
+
+## Legacy DeepSeek worker plugin (Codex and Claude Code)
 
 `plugins/deepseek-worker` delegates a bounded task to DeepSeek in a fresh Claude Code process. It does not change the default model in Codex or Claude Code and is not a native subagent. The worker can send everything it reads under the chosen `-C` directory to DeepSeek; use only a narrow, reviewed directory. This plugin needs macOS, Claude Code CLI, `jq`, and your own DeepSeek API key.
 

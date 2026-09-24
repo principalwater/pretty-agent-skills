@@ -1,0 +1,23 @@
+{
+  "name": "deepseek-worker",
+  "version": "0.1.0",
+  "description": "Delegate bounded tasks to an isolated DeepSeek worker from Codex or Claude Code.",
+  "author": {
+    "name": "principalwater",
+    "url": "https://github.com/principalwater"
+  },
+  "homepage": "https://github.com/principalwater/pretty-agent-skills",
+  "repository": "https://github.com/principalwater/pretty-agent-skills",
+  "license": "MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "DeepSeek Worker",
+    "shortDescription": "Delegate bounded work to DeepSeek",
+    "longDescription": "Run a fresh, narrowly scoped DeepSeek worker from Codex without changing your default model.",
+    "developerName": "principalwater",
+    "category": "Productivity",
+    "capabilities": ["Instructions"],
+    "websiteURL": "https://github.com/principalwater/pretty-agent-skills",
+    "defaultPrompt": "Use DeepSeek Flash for a bounded, non-sensitive subtask."
+  }
+}

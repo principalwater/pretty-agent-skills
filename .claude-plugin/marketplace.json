@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "pretty-agent-skills",
+  "description": "Portable agent skills from principalwater.",
+  "owner": {
+    "name": "principalwater",
+    "url": "https://github.com/principalwater"
+  },
+  "plugins": [
+    {
+      "name": "deepseek-worker",
+      "description": "Delegate bounded tasks to DeepSeek from Claude Code.",
+      "source": "./plugins/deepseek-worker",
+      "category": "productivity"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "deepseek-worker",
+  "version": "0.1.0",
+  "description": "Delegate bounded tasks to an isolated DeepSeek worker.",
+  "author": {
+    "name": "principalwater",
+    "url": "https://github.com/principalwater"
+  }
+}

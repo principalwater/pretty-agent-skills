@@ -9,7 +9,35 @@ Current skills:
 - `numbers` (`skills/numbers`) — Read, edit, create, and export Apple Numbers spreadsheets
 - `pages` (`skills/pages`) — Read, edit, create, and export Apple Pages documents
 
-## Install via npx (recommended)
+## DeepSeek worker plugin (Codex and Claude Code)
+
+`plugins/deepseek-worker` delegates a bounded task to DeepSeek in a fresh Claude Code process. It does not change the default model in Codex or Claude Code and is not a native subagent. The worker can send everything it reads under the chosen `-C` directory to DeepSeek; use only a narrow, reviewed directory. This plugin needs macOS, Claude Code CLI, `jq`, and your own DeepSeek API key.
+
+Install the plugin from this repository's marketplace:
+
+```sh
+codex plugin marketplace add principalwater/pretty-agent-skills
+codex plugin add deepseek-worker@pretty-agent-skills
+claude plugin marketplace add principalwater/pretty-agent-skills
+claude plugin install deepseek-worker@pretty-agent-skills --scope user
+```
+
+Find the installed skill's `SKILL.md`, then run its adjacent `scripts/setup --from-clipboard` after copying your key to the macOS clipboard. Never paste the key into a chat or command argument. Setup stores it in the login Keychain under service `pretty-agent-deepseek-worker`, account `default`, and clears the clipboard; `scripts/setup --check` confirms configuration without printing the key. For migration from an existing Keychain entry, use `scripts/setup --from-keychain SERVICE ACCOUNT`. Keychain access is deliberately trusted for `/usr/bin/security` to avoid a prompt on every run: **any process running as your macOS user can read this item**, so this is not malicious-process isolation.
+
+From either host, ask for the `deepseek-worker` skill. Its script defaults to Flash and read-only file tools; `--edit` is opt-in, and `--pro` is only for an explicit Pro request. The master reviews all output and edits. A tool-free `--evidence` mode accepts a reviewed UTF-8 file, but still sends its contents to DeepSeek. Run `scripts/selftest` for live boundary checks after a launcher or Claude Code update.
+
+Marketplace updates use the hosts' commands, followed by a new session/restart to pick up changed skill instructions:
+
+```sh
+codex plugin marketplace upgrade pretty-agent-skills
+codex plugin add deepseek-worker@pretty-agent-skills
+claude plugin marketplace update pretty-agent-skills
+claude plugin update deepseek-worker@pretty-agent-skills
+```
+
+These are update commands, not a promise that either host silently auto-updates on a schedule.
+
+## Install the design/iWork skills via npx
 
 Use the community installer CLI (`skills`) to install from this repo:
 

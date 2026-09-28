@@ -27,13 +27,20 @@ HOME="$tmp/home" PATH="$tmp/bin:$PATH" "$router" --worker codex --access edit -C
 grep -A1 '^--sandbox$' "$tmp/home/observed" | grep -q workspace-write
 
 print '#!/bin/zsh' > "$tmp/bin/claude"
-print 'if [[ $1 == --help ]]; then print -- "--restricted --strict-mcp-config --safe-mode --no-session-persistence --disable-slash-commands --tools --permission-mode --dangerously-skip-permissions"; exit 0; fi' >> "$tmp/bin/claude"
+print 'if [[ $1 == --help ]]; then [[ -t 1 ]] || { print -- "Usage: claude"; exit 0; }; print -- "--restricted --strict-mcp-config --safe-mode --no-session-persistence --disable-slash-commands --tools --permission-mode --dangerously-skip-permissions"; exit 0; fi' >> "$tmp/bin/claude"
+print 'if [[ -f $HOME/force-error ]]; then print -- '\''{"result":"You have hit your session limit · resets 9pm (Europe/Moscow)","modelUsage":{},"is_error":true}'\''; exit 1; fi' >> "$tmp/bin/claude"
 print 'print -l -- "$@" > "$HOME/observed"' >> "$tmp/bin/claude"
 print 'print -- '\''{"result":"OK","modelUsage":{"claude-test":{}},"is_error":false}'\''' >> "$tmp/bin/claude"
 chmod +x "$tmp/bin/claude"
 HOME="$tmp/home" PATH="$tmp/bin:$PATH" "$router" --worker claude --access full -C "$tmp/work" test | grep -q OK
 grep -q '^--dangerously-skip-permissions$' "$tmp/home/observed"
 ! grep -q '^--restricted$' "$tmp/home/observed"
+touch "$tmp/home/force-error"
+HOME="$tmp/home" PATH="$tmp/bin:$PATH" "$router" --worker claude -C "$tmp/work" test > /dev/null 2> "$tmp/claude-error" && exit 1
+grep -q 'session limit' "$tmp/claude-error"
+rm "$tmp/home/force-error"
+HOME="$tmp/home" PATH="$tmp/bin:$PATH" "$router" --worker claude -C "$tmp/work" test > /dev/null 2> "$tmp/claude-error" && exit 1
+grep -q 'Claude usage limit until' "$tmp/claude-error"
 HOME="$tmp/home" "${router:h}/setup" --full-access ask > /dev/null
 [[ $(< "$tmp/home/.config/agent-worker-router/full-access-policy") == ask ]]
 HOME="$tmp/home" "${router:h}/setup" --full-access deny > /dev/null

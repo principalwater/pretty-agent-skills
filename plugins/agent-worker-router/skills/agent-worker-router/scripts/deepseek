@@ -6,7 +6,7 @@ umask 077
 usage() { print 'usage: deepseek [--edit|--full] [--pro] [--evidence FILE] -C DIR [--timeout SEC] BRIEF|-'; }
 die() { print -u2 -- "deepseek-worker: $1"; exit ${2:-1}; }
 
-edit=0 full=0 pro=0 dir= evidence= timeout=1800
+edit=0 full=0 pro=0 dir= evidence= timeout=300
 while (( $# )); do
   case $1 in
     --edit) edit=1 ;; --full) full=1 ;;
@@ -74,7 +74,7 @@ key=$(/usr/bin/security find-generic-password -s pretty-agent-deepseek-worker -a
 [[ $key =~ '^sk-[A-Za-z0-9_-]{16,}$' ]] || { unset key; die 'Keychain item is not a DeepSeek key'; }
 unset key
 claude_bin=$(whence -p claude) || die 'Claude Code CLI not found'
-cli_help=$("$claude_bin" --help) || die 'could not inspect Claude Code CLI capabilities'
+cli_help=$(/usr/bin/script -q /dev/null "$claude_bin" --help) || die 'could not inspect Claude Code CLI capabilities'
 for flag in --restricted --strict-mcp-config --no-session-persistence --disallowedTools --tools --permission-mode --append-system-prompt --disable-slash-commands; do
   [[ $cli_help == *$flag* ]] || die "Claude Code CLI does not support $flag"
 done

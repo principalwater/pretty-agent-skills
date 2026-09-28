@@ -5,8 +5,9 @@ umask 077
 
 usage() { print 'usage: agent-worker-router --worker deepseek|claude|codex -C DIR [--access read|edit|full] [--pro] [--model MODEL] [--evidence FILE] [--timeout SEC] BRIEF|-'; }
 die() { print -u2 -- "agent-worker-router: $1"; exit ${2:-1}; }
+limit_time() { print -- "$(date -r "$1" '+%Y-%m-%d %H:%M %Z') (~$(( ($1 - $(date +%s) + 59) / 60 ))m)"; }
 
-worker= dir= model= evidence= timeout=1800 access=read pro=0
+worker= dir= model= evidence= timeout=300 access=read pro=0
 while (( $# )); do
   case $1 in
     --worker|-C|--model|--evidence|--timeout|--access)
@@ -61,6 +62,16 @@ case $worker in
   *) die 'unknown worker: expected deepseek, claude, or codex' 2 ;;
 esac
 
+if [[ $worker == claude ]]; then
+  claude_limit_file="$HOME/.config/agent-worker-router/claude-limit-until"
+  if [[ -f $claude_limit_file && ! -L $claude_limit_file ]]; then
+    claude_limit_until=$(< "$claude_limit_file")
+    if [[ $claude_limit_until == <-> ]] && (( claude_limit_until > $(date +%s) )); then
+      die "Claude usage limit until $(limit_time "$claude_limit_until"); skipping call" 75
+    fi
+  fi
+fi
+
 if [[ $access == full ]]; then
   "${0:A:h}/authorize-full" "$worker" "$dir" || die 'full access was not authorized' 2
 fi
@@ -70,7 +81,7 @@ cd "$dir"
 rc=0
 if [[ $worker == claude ]]; then
   claude_bin=$(whence -p claude) || die 'Claude Code CLI not found'
-  cli_help=$("$claude_bin" --help) || die 'could not inspect Claude Code CLI'
+  cli_help=$(/usr/bin/script -q /dev/null "$claude_bin" --help) || die 'could not inspect Claude Code CLI'
   for flag in --restricted --strict-mcp-config --safe-mode --no-session-persistence --disable-slash-commands --tools --permission-mode; do
     [[ $cli_help == *$flag* ]] || die "Claude Code CLI does not support $flag"
   done
@@ -104,7 +115,32 @@ if [[ $worker == claude ]]; then
   jq -e 'type == "object" and (.result | type == "string") and ((.modelUsage // {}) | type == "object")' "$out" >/dev/null || die "invalid Claude JSON (exit $rc): $out"
   foreign=$(jq -r '.modelUsage // {} | keys[] | select(startswith("claude-") | not)' "$out")
   [[ -z $foreign ]] || die "a non-Claude model responded: $foreign" 3
-  (( rc == 0 )) && [[ $(jq -r '.is_error' "$out") == false ]] || die "Claude failed (exit $rc): $out"
+  if (( rc != 0 )) || [[ $(jq -r '.is_error' "$out") != false ]]; then
+    failure=$(jq -r '.result // empty' "$out")
+    print -u2 -- "$failure"
+    if [[ $failure == *'session limit'* && $failure =~ 'resets ([0-9]{1,2})(:([0-9]{2}))?(am|pm) \(([-A-Za-z_+/]+)\)' ]]; then
+      reset_hour=$match[1] reset_minute=${match[3]:-00} reset_period=$match[4] reset_zone=$match[5]
+      if [[ -f /usr/share/zoneinfo/$reset_zone ]]; then
+        reset_day=$(TZ="$reset_zone" date +%Y-%m-%d)
+        reset_until=$(TZ="$reset_zone" date -j -f '%Y-%m-%d %I:%M:%S%p' "$reset_day $reset_hour:$reset_minute:00$reset_period" +%s) || reset_until=
+        if [[ -n $reset_until ]]; then
+          if (( reset_until <= $(date +%s) )); then
+            reset_day=$(TZ="$reset_zone" date -v+1d +%Y-%m-%d)
+            reset_until=$(TZ="$reset_zone" date -j -f '%Y-%m-%d %I:%M:%S%p' "$reset_day $reset_hour:$reset_minute:00$reset_period" +%s) || reset_until=
+          fi
+          if [[ -n $reset_until ]]; then
+            mkdir -p "${claude_limit_file:h}"
+            chmod 700 "${claude_limit_file:h}"
+            limit_tmp=$(mktemp "${claude_limit_file:h}/claude-limit.XXXXXX")
+            print -r -- "$reset_until" > "$limit_tmp"
+            mv -- "$limit_tmp" "$claude_limit_file"
+            print -u2 -- "agent-worker-router: Claude usage limit until $(limit_time "$reset_until"); future calls will be skipped"
+          fi
+        fi
+      fi
+    fi
+    die "Claude failed (exit $rc): $out"
+  fi
   jq -e '(.modelUsage // {} | length) > 0 and (.result | length > 0)' "$out" >/dev/null || die "empty Claude response: $out"
   jq -r --arg f "$out" '"agent-worker-router: worker=claude models=\((.modelUsage // {}) | keys | join(",")) json=\($f)"' "$out" >&2
   jq -r '.result' "$out"

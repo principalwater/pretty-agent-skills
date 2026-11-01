@@ -1,15 +1,52 @@
 #!/bin/zsh
-# Live boundary check after updating Claude Code or this script.
+# CLI contracts are checked without quota before optional live DeepSeek boundaries.
 set -euo pipefail
 w=${0:A:h}/deepseek
 t=$(mktemp -d)
 trap 'rm -rf -- "$t"' EXIT
-mkdir "$t/work" "$t/outside"
+fail() { print -u2 -- "selftest FAIL: $1"; exit 1; }
+mkdir "$t/home" "$t/work"
+codex_bin=$(whence -p codex) || fail 'Codex CLI not found'
+claude_bin=$(whence -p claude) || fail 'Claude Code CLI not found'
+clean_env=(env -i "HOME=$t/home" "PATH=$PATH" "TMPDIR=$t" TERM=dumb)
+help=$("${clean_env[@]}" "$codex_bin" exec --help) || fail 'Codex help'
+for flag in --sandbox --ephemeral --ignore-user-config --skip-git-repo-check --output-last-message --dangerously-bypass-approvals-and-sandbox --model -c; do
+  [[ $help == *$flag* ]] || fail "Codex missing $flag"
+done
+help=$("${clean_env[@]}" "$codex_bin" exec resume --help) || fail 'Codex resume help'
+for flag in --ignore-user-config --skip-git-repo-check --output-last-message --dangerously-bypass-approvals-and-sandbox --model -c; do
+  [[ $help == *$flag* ]] || fail "Codex resume missing $flag"
+done
+help=$("${clean_env[@]}" /usr/bin/script -q /dev/null "$claude_bin" --help < /dev/null) || fail 'Claude help'
+for flag in --restricted --strict-mcp-config --safe-mode --no-session-persistence --disable-slash-commands --tools --permission-mode --permission-prompts --output-format --dangerously-skip-permissions --model --effort --resume; do
+  [[ $help == *$flag* ]] || fail "Claude missing $flag"
+done
+mkdir "$t/home/.codex"
+cat > "$t/home/.codex/config.toml" <<'CONFIG'
+model = "banner-contract-model"
+model_reasoning_effort = "high"
+model_provider = "selftest"
+[model_providers.selftest]
+name = "Selftest"
+base_url = "http://127.0.0.1:9/v1"
+wire_api = "responses"
+requires_openai_auth = false
+CONFIG
+"${clean_env[@]}" "${0:A:h}/agent-worker-router" --worker codex -C "$t/work" --timeout 8 test > "$t/answer" 2> "$t/diagnostics" || true
+sed -n 's/^agent-worker-router: receipt //p' "$t/diagnostics" > "$t/receipt"
+jq -se 'length == 1 and (.[0] | .model == "banner-contract-model" and .effort == "high" and .provider == "selftest")' "$t/receipt" >/dev/null || fail 'Codex banner contract'
+print 'selftest offline contracts OK'
+
+if ! "${0:A:h}/setup" --check; then
+  print 'selftest: skipping live DeepSeek checks (setup --check failed)'
+  print 'selftest OK (offline contracts passed; live DeepSeek checks skipped)'
+  exit 0
+fi
+mkdir "$t/outside"
 print 'animal: pelican' > "$t/work/note.txt"
 print 'API_TOKEN=selftest-dummy' > "$t/work/.env"
 print 'outside-secret: walrus' > "$t/outside/secret.txt"
 ln -s "$t/outside" "$t/work/link"
-fail() { print -u2 -- "selftest FAIL: $1"; exit 1; }
 
 "$w" --evidence "$t/work/.env" -C "$t/work" test >/dev/null 2>&1 && fail 'accepted .env as evidence'
 "$w" --edit --evidence "$t/work/note.txt" -C "$t/work" test >/dev/null 2>&1 && fail 'allowed edit with evidence'

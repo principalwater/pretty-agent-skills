@@ -1,0 +1,1929 @@
+#!/usr/bin/python3 -IS
+"""Claude Code PreToolUse hook that keeps agent sessions on the worker router and destructive actions with the user.
+Two policies, one hook entry each:
+
+  agent-worker-guard                Codex starts only through ~/.local/bin/agent-worker (deny)
+  agent-worker-guard --destructive  destructive commands and MCP calls wait for the user's approval
+  agent-worker-guard --all          both, for a single hook entry
+  agent-worker-guard --selftest [RULES]  decision tables of both policies, the local rules' own cases included
+
+Codex policy. A direct launch (codex exec/review/app-server, codex-companion.mjs task/review, the
+codex:codex-rescue agent) runs with the user's whole Codex config: every MCP server, its sandbox and approval
+settings, and on the plugin route a shared broker that outlives the caller. agent-worker confines the worker instead.
+
+Destructive policy. Destructive actions only with the user's own approval, never in checks. The rules are data in
+~/.config/agent-worker-router/destructive-rules.json (the repository ships destructive-rules.default.json for it),
+read on every call together with destructive-rules.local.json from the same directory: the machine's own tools,
+accounts and MCP servers, kept out of the repository. A match returns the rules' decision: "ask", or "deny" in the
+permission modes they list.
+
+Off switches, for the user only (the guard refuses agents that touch them): AGENT_WORKER_GUARD=off and
+AGENT_DESTRUCTIVE_GUARD=off in the environment of Claude Code; the files allow-direct-codex (until removed) and
+allow-destructive (15 minutes from its mtime, also opens the rules files and the settings below to edits) in
+~/.config/agent-worker-router. Settings that would switch the guard off are protected the same way: its hook entries
+in the user settings file, and disableAllHooks or the env switches in any Claude settings file.
+The hook sees only tool calls of Claude sessions: manual runs in a terminal never pass through it. Internal errors
+allow the call, so a broken guard cannot break every tool call; unreadable rules say so to the user.
+"""
+import glob
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+CONFIG = os.path.expanduser("~/.config/agent-worker-router")
+CODEX_FLAG = os.path.join(CONFIG, "allow-direct-codex")
+DESTRUCTIVE_FLAG = os.path.join(CONFIG, "allow-destructive")
+RULES_FILE = os.path.join(CONFIG, "destructive-rules.json")
+LOCAL_RULES = "destructive-rules.local.json"
+SETTINGS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "settings.json")
+GUARD_ENV = ("AGENT_WORKER_GUARD", "AGENT_DESTRUCTIVE_GUARD")
+FLAG_TTL = 15 * 60
+# The guard's words; the rules' "messages" table may replace any of them (codex_why, codex_use, codex_launch,
+# codex_agent, protect, rule).
+MESSAGES = {
+    "codex_why": "A direct launch runs with the whole Codex config: every MCP server, its sandbox and approval "
+                 "settings, a shared broker.",
+    "codex_use": "Use `~/.local/bin/agent-worker research -C DIR [--access read|edit] BRIEF` "
+                 "(roles and routes: `agent-worker --help`).",
+    "codex_launch": "Starting Codex outside agent-worker is blocked by the harness ({reason}). {why} {use}",
+    "codex_agent": "The agent {kind} is blocked by the harness. {why} {use}",
+    "protect": "Only the user changes the guard's switches and rules.",
+    "rule": "{message} Rule {id}: {why}. Command: {what}",
+    "fallback": "the guard could not read the command {heads}, which it has to check",
+}
+DEFAULT_MESSAGES = dict(MESSAGES)
+# codex subcommands that run a model or an agent runtime, or apply its changes to the tree.
+CODEX_RUN = {"exec", "e", "review", "resume", "fork", "app-server", "exec-server", "mcp-server", "cloud",
+             "cloud-tasks", "agents", "remote-control", "queue", "apply", "a"}
+# Inspection and management; any other positional after `codex` is a prompt for the interactive agent.
+CODEX_SAFE = {"help", "login", "logout", "mcp", "plugin", "completion", "update", "doctor", "sandbox",
+              "debug", "archive", "delete", "unarchive", "migrate-rollouts", "features", "app"}
+CODEX_VALUE_OPTS = {"-c", "--config", "--enable", "--disable", "--remote", "--remote-auth-token-env", "-m",
+                    "--model", "-p", "--profile", "-s", "--sandbox", "-a", "--ask-for-approval", "-C", "--cd",
+                    "-i", "--image", "--add-dir", "--local-provider"}
+COMPANION_SAFE = {"help", "status", "result", "cancel", "setup"}
+RUNTIME = {"codex-companion.mjs", "app-server-broker.mjs"}
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+INTERPRETERS = {"node", "nodejs", "bun", "deno", "python", "python3", "perl", "ruby"}
+# Words that run the next word as a command: `timeout 60 codex exec` is still a codex launch. The rules add their
+# own ("launchers"), and name the ones whose own options run up to `--` ("launcher_options_end").
+LAUNCHERS = {"env", "command", "exec", "nohup", "time", "timeout", "gtimeout", "nice", "caffeinate", "sudo",
+             "xargs", "npx", "bunx", "pnpx", "stdbuf", "script", "arch"}
+DASHDASH_LAUNCHERS = set()
+# Commands that run a later word: `perl -e 'exec @ARGV' codex exec` launches codex, `echo codex exec` does not.
+EXEC_HEADS = INTERPRETERS | {"parallel", "watch", "find", "flock", "unbuffer", "screen", "tmux", "ssh"}
+# Reading a protected file is fine; anything else that names it is not.
+VIEWERS = {"cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "rg", "jq", "wc", "diff", "cmp",
+           "shasum", "sha256sum", "md5", "stat", "ls", "file", "bat", "[", "[[", "test"}
+# Printing a protected file's name is fine too (a redirect into it counts on its own); printing an off switch is not.
+PRINTERS = {"echo", "printf", "print"}
+SSH_VALUE_OPTS = {"-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q",
+                  "-R", "-S", "-W", "-w"}
+SCRIPT_LIMIT = 256 * 1024
+# The sanctioned runners: agent-worker, the router it wraps (the router's skill calls it by absolute path), the
+# router's tests, whose controls run Codex against a scripted local model, and the installed guard itself, whose
+# self-test tables quote Codex calls. Any other copy of the guard is scanned like any script.
+TRUSTED = re.compile(r"/agent-worker-router/scripts/agent-worker-router$|/tests/agent-worker-router-[a-z]+\.zsh$|"
+                     + re.escape(os.path.expanduser("~/.local/bin/agent-worker")) + "(?:-guard)?$")
+# Commands whose last word is the only one they write: `cp settings.json settings.json.bak` only reads it.
+COPIERS = {"cp", "rsync", "ditto"}
+PUNCT = set(";&|()<>\n")
+# Shell words that open a clause: in `for f in a; do rm -rf "$f"; done` the command after `do` is rm.
+RESERVED = {"do", "then", "else", "elif", "if", "while", "until", "!", "{", "}"}
+VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+TEMP = "\0temp"
+HEREDOCS = {}
+HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+SUBST = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+CODE_CALL = re.compile(r"codex-companion\.mjs|app-server-broker\.mjs|"
+                       r"[\"']codex[\"']\s*,\s*\[?\s*[\"'](?:exec|e|review|resume|fork|app-server|exec-server)[\"']")
+SQL_STRING = re.compile(r"'(?:[^'\\]|\\.|'')*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`|@@.*?@@", re.S)
+SQL_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.S)
+# Writes that can hide inside a statement that starts with a read keyword (YQL DEFINE ACTION ... AS INSERT ...).
+SQL_WRITE = re.compile(
+    r"\b(insert (into|overwrite) (?!@)|upsert into|replace into|delete from|update \S+ set|"
+    r"(?<!show )(?<!exists )(drop|create|alter|truncate|rename|attach|detach|exchange|undrop) "
+    r"(temporary |or replace )?(table|view|database|dictionary|function|user|role|quota|policy|profile|settings|index|"
+    r"materialized|live|window|named|row|object|topic|external|async|if|cluster)\b|optimize table|"
+    r"kill (query|mutation)|system (drop|reload|stop|start|flush|restart|sync|kill|shutdown|freeze|unfreeze|restore))",
+    re.I)
+
+
+def base(word):
+    return word.rstrip("/").rsplit("/", 1)[-1]
+
+
+def strip_comments(text):
+    """The text without its shell comments: as in the shell, `#` starts one only at the start of a word and outside
+    quotes, so `${#x}`, `${p#pre}` and `https://x/#top` stay words."""
+    out, quote, k = [], None, 0
+    while k < len(text):
+        ch = text[k]
+        if quote:
+            if ch == "\\" and quote == '"' and k + 1 < len(text):
+                out.append(text[k:k + 2])
+                k += 2
+                continue
+            quote = None if ch == quote else quote
+        elif ch == "\\" and k + 1 < len(text):
+            out.append(text[k:k + 2])
+            k += 2
+            continue
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (k == 0 or text[k - 1] in " \t\r\n;&|()<>"):
+            end = text.find("\n", k)
+            k = len(text) if end < 0 else end
+            continue
+        out.append(ch)
+        k += 1
+    return "".join(out)
+
+
+def skip_span(text, i, closer):
+    """Index just past a span opened right before i that closes with closer: ' (literal), " (with $(...) and `...`
+    inside), ) for $( (any quoting inside) or ` (backticks); an unclosed span runs to the end."""
+    while i < len(text):
+        ch = text[i]
+        if closer == "'":
+            if ch == "'":
+                return i + 1
+        elif ch == "\\":
+            i += 2
+            continue
+        elif ch == closer:
+            return i + 1
+        elif text.startswith("$(", i):
+            i = skip_span(text, i + 2, ")")
+            continue
+        elif ch == "`":
+            i = skip_span(text, i + 1, "`")
+            continue
+        elif closer != '"' and ch in "'\"":
+            i = skip_span(text, i + 1, ch)
+            continue
+        elif closer == ")" and ch == "(":
+            i = skip_span(text, i + 1, ")")
+            continue
+        i += 1
+    return len(text)
+
+
+def blank_quotes(text):
+    """The text with every quoted span, substitutions inside it included, replaced by Q."""
+    out, i = [], 0
+    while i < len(text):
+        if text[i] == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+        elif text[i] in "'\"":
+            i = skip_span(text, i + 1, text[i])
+            out.append("Q")
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def tokens(text):
+    lex = shlex.shlex(strip_comments(text), posix=True, punctuation_chars=";&|()<>\n")
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    lex.commenters = ""
+    return list(lex)
+
+
+def fold_heredocs(text):
+    """The text with each heredoc body moved into HEREDOCS and replaced by its key."""
+    lines, kept, i = text.split("\n"), [], 0
+    while i < len(lines):
+        line, out, last = lines[i], [], 0
+        i += 1
+        for match in HEREDOC.finditer(line):
+            body = []
+            while i < len(lines) and lines[i].strip() != match.group(2):
+                body.append(lines[i])
+                i += 1
+            i += 1
+            key = f"__HEREDOC_{len(HEREDOCS)}__"
+            HEREDOCS[key] = "\n".join(body)
+            out.append(line[last:match.start()] + "<< " + key)
+            last = match.end()
+        kept.append("".join(out) + line[last:])
+    return "\n".join(kept)
+
+
+def raw_heads(text):
+    """Command words of a shell text read without the parser, outside quotes, comments and heredoc bodies: the
+    safety net for commands the parser misses."""
+    heads = set()
+    for segment in re.split(r"\$\(|[;&|()`\n]", blank_quotes(strip_comments(fold_heredocs(text)))):
+        words = segment.split()
+        c = command_index(words)
+        if c < len(words):
+            heads.add(base(words[c]))
+    return heads
+
+
+def parse(text):
+    """Simple commands of a shell text: words, redirections (a heredoc carries its body), the command piping in."""
+    commands, toks, k = [], tokens(fold_heredocs(text)), 0
+    cur = {"words": [], "redir": [], "pipe": None}
+    while k < len(toks):
+        tok = toks[k]
+        k += 1
+        if tok.endswith("$") and k < len(toks) and toks[k] == "(":
+            # `T=$(mktemp -d)` stays one word; the command inside is checked on its own as well.
+            inner, depth, k, closed = [], 1, k + 1, False
+            while k < len(toks) and not closed:
+                part = toks[k]
+                k += 1
+                if part and set(part) <= PUNCT:
+                    for n, ch in enumerate(part):
+                        depth += (ch == "(") - (ch == ")")
+                        if depth == 0:
+                            closed, rest, part = True, part[n + 1:], part[:n]
+                            if rest:
+                                k -= 1
+                                toks[k] = rest
+                            break
+                    if part:
+                        inner.append(part)
+                    continue
+                inner.append(shlex.quote(part))
+            text = " ".join(inner)
+            commands.extend(parse(text))
+            cur["words"].append(f"{tok}({text})")
+            continue
+        if tok and set(tok) <= PUNCT:
+            if "<" in tok or ">" in tok:
+                target = toks[k] if k < len(toks) else ""
+                k += 1
+                if "(" in tok and not cur["words"]:
+                    cur["sub"] = target  # `diff <(jq . a) <(jq . b)`: the second command runs jq
+                cur["redir"].append((tok, HEREDOCS.get(target, target) if tok == "<<" else target))
+                continue
+            done = cur if cur["words"] or cur["redir"] else None
+            if done:
+                commands.append(done)
+            cur = {"words": [], "redir": [], "pipe": done if tok in ("|", "|&") else None}
+            continue
+        cur["words"].append(tok)
+    if cur["words"] or cur["redir"]:
+        commands.append(cur)
+    return commands
+
+
+def command_index(cmd):
+    """Index of the word a simple command runs, past assignments, launchers and their options."""
+    i = 0
+    while i < len(cmd):
+        word = cmd[i]
+        if word in RESERVED or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", word) or \
+                (i and (word.startswith("-") or re.match(r"^[0-9.]+[smhd]?$", word))):
+            i += 1
+        elif base(word) == "command" and cmd[i + 1:i + 2] in (["-v"], ["-V"]):
+            return len(cmd)
+        elif base(word) in LAUNCHERS and i + 1 < len(cmd):
+            i += 1
+            if base(word) in DASHDASH_LAUNCHERS:
+                while i < len(cmd) and cmd[i] != "--":
+                    i += 1
+                i += 1
+        else:
+            return i
+    return len(cmd)
+
+
+def read_script(path, cwd):
+    path = os.path.join(cwd, os.path.expanduser(path))
+    try:
+        if TRUSTED.search(os.path.realpath(path)):
+            return None
+        if os.path.isfile(path) and os.path.getsize(path) <= SCRIPT_LIMIT:
+            with open(path, "rb") as f:
+                data = f.read()
+            if b"\0" not in data:
+                return data.decode("utf-8", "replace")
+    except OSError:
+        pass
+    return None
+
+
+def read_text(path, ctx, cwd):
+    """A file's text, preferring what an earlier command of the same text wrote there (heredoc, echo, printf)."""
+    full = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
+    if ctx is not None and full in ctx.get("files", {}):
+        return ctx["files"][full]
+    return read_script(path, cwd)
+
+
+def expand(word, ctx):
+    """Values a shell word can take after variable expansion, or None when a variable is unknown.
+
+    ctx["vars"] holds what earlier commands of the same text assigned (None: assigned but unknown), ctx["env"]
+    the environment the shell inherits. A word from `$(mktemp ...)` is a directory the command made itself."""
+    if ctx is None:
+        return None if "$" in word else [word]
+    match = re.fullmatch(r"\$\(\s*mktemp\b[^)]*\)(/.*)?", word)
+    if match:
+        return [TEMP + (match.group(1) or "")]
+    match = re.fullmatch(r"\$\(\s*cat\s*<<\s*(__HEREDOC_\d+__)\s*\)", word)
+    if match:
+        return [HEREDOCS.get(match.group(1), "")]
+    match = re.fullmatch(r"\$\(\s*(?:cat\s+|<\s*)(\S+?)\s*\)", word)
+    if match:
+        files = expand(match.group(1).strip("'\""), ctx)
+        texts = [read_text(f, ctx, ctx["cwd"] or "/") for f in files] if files else [None]
+        return None if None in texts else texts
+    if "$(" in word or "`" in word or re.search(r"\$[0-9@*#?!$-]", word):
+        return None
+    out, last = [""], 0
+    for match in VAR.finditer(word):
+        name = match.group(1) or match.group(2)
+        if name in ctx["vars"]:
+            values = ctx["vars"][name]
+        else:
+            values = [ctx["env"][name]] if name in ctx["env"] else None
+        if values is None:
+            return None
+        out = [o + word[last:match.start()] + v for o in out for v in values][:32]
+        last = match.end()
+    return [o + word[last:] for o in out]
+
+
+def fed_text(cmd, cwd, ctx=None):
+    """What a command reads on stdin when that is knowable: a heredoc, a here-string, a file, echo or cat."""
+    for op, target in cmd["redir"]:
+        if op in ("<<", "<<<"):
+            return target
+        if op == "<":
+            files = expand(target, ctx)
+            texts = [read_text(f, ctx, cwd) for f in files] if files else [None]
+            return None if None in texts else "\n".join(texts)
+    src = cmd["pipe"]
+    if src:
+        words = src["words"]
+        c = command_index(words)
+        head = base(words[c]) if c < len(words) else ""
+        if head in ("echo", "printf"):
+            parts = [expand(w, ctx) for w in words[c + 1:] if not w.startswith("-")]
+            return None if None in parts else " ".join(p[0] for p in parts if p)
+        if head == "cat":
+            files = [w for w in words[c + 1:] if not w.startswith("-")]
+            if files:
+                texts = []
+                for word in files:
+                    names = expand(word, ctx)
+                    texts += [read_text(f, ctx, cwd) for f in names] if names else [None]
+                return None if None in texts else "\n".join(texts)
+            return fed_text(src, cwd, ctx)
+    return None
+
+
+def nested(cmd, c, cwd):
+    """Shell texts a simple command runs itself: sh -c, eval, a shell fed on stdin, ssh, find -exec."""
+    words = cmd["words"]
+    head, args = base(words[c]), words[c + 1:]
+    if head in SHELLS:
+        for k, word in enumerate(args):
+            if re.match(r"^-[a-z]*c[a-z]*$", word) and k + 1 < len(args):
+                return [args[k + 1]]
+        if not [w for w in args if not w.startswith("-")]:
+            text = fed_text(cmd, cwd)
+            return [text] if text else []
+    if head == "eval":
+        return [" ".join(args)]
+    if head == "ssh":
+        k = 0
+        while k < len(args) and args[k].startswith("-"):
+            k += 2 if args[k] in SSH_VALUE_OPTS else 1
+        return [" ".join(args[k + 1:])] if k + 1 < len(args) else []
+    if head == "find":
+        roots = []
+        for word in args:
+            if word.startswith(("-", "(", "!")):
+                break
+            roots.append(word)
+        out, k = [], 0
+        while k < len(args):
+            if args[k] in ("-exec", "-execdir", "-ok", "-okdir"):
+                part = []
+                k += 1
+                while k < len(args) and args[k] not in (";", "+"):
+                    part.append(args[k])
+                    k += 1
+                for root in roots or ["."]:
+                    out.append(" ".join(shlex.quote(root if w == "{}" else w) for w in part))
+            k += 1
+        return out
+    return []
+
+
+def script_body(cmd, c, cwd):
+    words = cmd["words"]
+    head, args = base(words[c]), words[c + 1:]
+    path = None
+    if head in SHELLS | INTERPRETERS | {"source", "."}:
+        path = next((w for w in args if not w.startswith("-")), None)
+    elif "/" in words[c]:
+        path = words[c]
+    body = read_script(path, cwd) if path else None
+    if body is None:
+        return None, None, None
+    shellish = head in SHELLS | {"source", "."} or re.match(r"#!.*\b(sh|bash|zsh|dash|ksh)\b", body)
+    return path, body, bool(shellish)
+
+
+# --- Codex policy ---
+
+def codex_args(cmd, i):
+    """(subcommand or None, words after it, flags seen) for the codex word at index i."""
+    j, flags = i + 1, set()
+    while j < len(cmd):
+        word = cmd[j]
+        if word in CODEX_VALUE_OPTS:
+            j += 2
+        elif word.startswith("-"):
+            flags.add(word.split("=", 1)[0])
+            j += 1
+        else:
+            return word, cmd[j + 1:], flags
+    return None, [], flags
+
+
+def is_help(words):
+    return any(w in ("-h", "--help", "help") for w in words)
+
+
+def check_codex(cmd, i, at_command, script):
+    sub, rest, flags = codex_args(cmd, i)
+    # Inside a script a bare `codex` word is far more often a case pattern (`claude|codex)`) than a launch.
+    if sub is None:
+        if flags & {"-h", "--help", "-V", "--version"} or not at_command or script:
+            return None
+        return "interactive codex"
+    if sub in CODEX_RUN:
+        return None if is_help(rest) or sub == "help" else f"codex {sub}"
+    if sub == "debug" and rest[:1] == ["app-server"] and not is_help(rest):
+        return "codex debug app-server"
+    if sub in CODEX_SAFE or not at_command or script:
+        return None
+    return "codex with a prompt"
+
+
+def check_runtime(cmd, i, at_command):
+    name = base(cmd[i])
+    executed = at_command or any(base(w) in INTERPRETERS | LAUNCHERS for w in cmd[:i])
+    if not executed:
+        return None
+    if name == "app-server-broker.mjs":
+        return name
+    rest = [w for w in cmd[i + 1:] if not w.startswith("-")]
+    sub = rest[0] if rest else "help"
+    if sub in COMPANION_SAFE and "--enable-review-gate" not in cmd[i + 1:]:
+        return None
+    return f"{name} {sub}"
+
+
+def codex_reason(text, cwd, depth=0, script=False):
+    """Reason to deny a shell text under the Codex policy, or None."""
+    if depth > 3:
+        return None
+    try:
+        commands = parse(text)
+    except ValueError:
+        # Unbalanced quotes: the shell would refuse the line too, unless it is a fragment we cannot read.
+        return "codex-companion" if CODE_CALL.search(text) else None
+    # $(...) and backticks run inside double quotes too. Searched in the tokens, so comments do not count;
+    # a single-quoted substitution is only text, but rare enough.
+    for match in SUBST.finditer(" ".join(" ".join(cmd["words"]) for cmd in commands)):
+        reason = codex_reason(match.group(1) or match.group(2) or "", cwd, depth + 1, script)
+        if reason:
+            return reason
+    for cmd in commands:
+        words = cmd["words"]
+        c = command_index(words)
+        runs_words = c < len(words) and base(words[c]) in EXEC_HEADS
+        for i, word in enumerate(words):
+            name = base(word)
+            if name == "codex" and (i == c or runs_words):
+                reason = check_codex(words, i, i == c, script)
+            elif name in RUNTIME:
+                reason = check_runtime(words, i, i == c)
+            else:
+                continue
+            if reason:
+                return reason
+        if c >= len(words):
+            continue
+        head, args = base(words[c]), words[c + 1:]
+        if head in INTERPRETERS:
+            for k, word in enumerate(args):
+                if word in ("-c", "-e", "--eval", "-p", "--print") and k + 1 < len(args) and CODE_CALL.search(args[k + 1]):
+                    return f"{head} {word} calling codex"
+            text = fed_text(cmd, cwd)
+            if text and CODE_CALL.search(text):
+                return "codex-companion in a heredoc"
+        for text in nested(cmd, c, cwd):
+            reason = codex_reason(text, cwd, depth + 1, script)
+            if reason:
+                return reason
+        path, body, shellish = script_body(cmd, c, cwd)
+        if body is not None:
+            reason = codex_reason(body, cwd, depth + 1, True) if shellish else ("script" if CODE_CALL.search(body) else None)
+            if reason:
+                return f"{reason} (in {path})"
+    # A script reaches the runtime through a variable (`comp=.../codex-companion.mjs; node "$comp" task`).
+    if script and any(base(w).endswith(tuple(RUNTIME)) for cmd in commands for w in cmd["words"]) and \
+            any(base(w) in INTERPRETERS for cmd in commands for w in cmd["words"]):
+        return "codex-companion in a script"
+    return None
+
+
+def decide_codex(event, env):
+    """Deny message under the Codex policy, or None."""
+    if env.get("AGENT_WORKER_GUARD", "").lower() in ("off", "0", "false") or os.path.exists(CODEX_FLAG):
+        return None
+    tool, data = event.get("tool_name", ""), event.get("tool_input") or {}
+    if tool in ("Agent", "Task"):
+        kind = str(data.get("subagent_type") or "")
+        return text("codex_agent", kind=kind) if kind.startswith("codex:") else None
+    if tool in ("Bash", "mcp__terminal__run_in_terminal"):
+        command = str(data.get("command") or "")
+        if "codex" not in command and "app-server-broker" not in command and not re.search(r"[./]\w", command):
+            return None
+        reason = codex_reason(command, event.get("cwd") or os.getcwd())
+        if reason:
+            return text("codex_launch", reason=reason)
+    return None
+
+
+# --- protected switches and rules ---
+
+def fresh(path):
+    try:
+        return time.time() - os.stat(path).st_mtime < FLAG_TTL
+    except OSError:
+        return False
+
+
+def home_path(word):
+    """A word with ~ and $HOME spelled out."""
+    home = os.path.expanduser("~")
+    return re.sub(r"\$\{HOME\}|\$HOME(?![A-Za-z0-9_])|(?<![^\s'\"=:(])~(?=/|$)", lambda m: home, word)
+
+
+def settings_named(word, cwd):
+    """Kinds ("user", "project") of the Claude settings files a shell word holds a path to, as an argument or inside
+    code."""
+    return {settings_kind(os.path.join(cwd, m.group(0)))
+            for m in re.finditer(r"[^\s'\"=:;,()<>|&`]*settings(?:\.local)?\.json(?![\w.-])", home_path(word))} - {None}
+
+
+def into_settings_dir(words, cwd):
+    """`cp /tmp/settings.json ~/.claude/`: a settings.json copied or moved into the user settings directory."""
+    folder = os.path.dirname(os.path.realpath(SETTINGS))
+    return any(base(w) == "settings.json" for w in words) and \
+        any(os.path.realpath(os.path.join(cwd, home_path(w))) == folder for w in words)
+
+
+def settings_kind(path):
+    """"user" for the user settings file, "project" for another Claude settings file, else None."""
+    full = os.path.realpath(path)
+    if full == os.path.realpath(SETTINGS):
+        return "user"
+    if base(full) in ("settings.json", "settings.local.json") and base(os.path.dirname(full)) == ".claude":
+        return "project"
+    return None
+
+
+def switches(text, user):
+    """What in a settings text switches the guard off: disableAllHooks, the env switches and, in the user settings,
+    the guard's hook entries. A user settings file that does not parse loses every hook in it."""
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return "unreadable" if user else (False, {}, [])
+    env = data["env"] if isinstance(data.get("env"), dict) else {}
+    hooks = data["hooks"] if user and isinstance(data.get("hooks"), dict) else {}
+    entries = sorted(json.dumps([event, entry.get("matcher"), hook], sort_keys=True)
+                     for event, items in hooks.items() if isinstance(items, list)
+                     for entry in items if isinstance(entry, dict)
+                     for hook in (entry.get("hooks") or []) if isinstance(hook, dict)
+                     and "agent-worker-guard" in str(hook.get("command", "")))
+    return bool(data.get("disableAllHooks")), {k: env[k] for k in GUARD_ENV if k in env}, entries
+
+
+def edited(tool, data, path):
+    """(text before, text after) of a Write, Edit or MultiEdit."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        text = ""
+    if tool == "Write":
+        return text, str(data.get("content") or "")
+    new = text
+    for edit in (data.get("edits") if tool == "MultiEdit" else [data]) or []:
+        if not isinstance(edit, dict):
+            continue
+        old, replacement = str(edit.get("old_string") or ""), str(edit.get("new_string") or "")
+        if old:
+            new = new.replace(old, replacement, -1 if edit.get("replace_all") else 1)
+        elif not new:
+            new = replacement
+    return text, new
+
+
+def protect(event):
+    """Deny when a tool call would set an off switch or change the rules or the guard's settings (the rules and the
+    settings: unless the user opened them)."""
+    opened = fresh(DESTRUCTIVE_FLAG)
+    files = ["allow-direct-codex", "allow-destructive"] + ([] if opened else ["destructive-rules.json", LOCAL_RULES])
+    tool, data = event.get("tool_name", ""), event.get("tool_input") or {}
+    cwd = event.get("cwd") or os.getcwd()
+    if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        path = str(data.get("file_path") or data.get("notebook_path") or "")
+        if base(path) in files:
+            return text("protect")
+        full = os.path.join(cwd, os.path.expanduser(path))
+        kind = None if opened or tool == "NotebookEdit" else settings_kind(full)
+        if kind:
+            before, after = edited(tool, data, full)
+            if switches(before, kind == "user") != switches(after, kind == "user"):
+                return text("protect")
+        return None
+    if tool in ("Bash", "mcp__terminal__run_in_terminal"):
+        command = str(data.get("command") or "")
+        switch_words = [] if opened else [*GUARD_ENV, "disableAllHooks"]
+        settings = not opened and re.search(r"settings(?:\.local)?\.json", command) is not None
+        if not settings and not any(name in command for name in files + switch_words):
+            return None
+        switched = any(word in command for word in switch_words)
+        try:
+            commands = parse(command)
+        except ValueError:
+            named = any(name in command for name in files + switch_words) or \
+                settings and "user" in settings_named(command, cwd)
+            return text("protect") if named else None
+        values = {}
+
+        def spelled(word):
+            return VAR.sub(lambda m: values.get(m.group(1) or m.group(2), m.group(0)), str(word))
+
+        def own(word):
+            """The word names one of the guard's files: an off switch, the rules, the user settings."""
+            return any(name in word for name in files) or settings and "user" in settings_named(word, cwd)
+
+        for cmd in commands:
+            words = [spelled(w) for w in cmd["words"]]
+            if words[:1] == ["cd"]:
+                cwd = os.path.realpath(os.path.join(cwd, home_path(words[1] if len(words) > 1 else "~")))
+                continue
+            # `F=~/.claude/settings.json` and `for f in ...` only name a path; what later commands do with it counts.
+            pairs = [re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", w, re.S) for w in words]
+            if words and all(pairs):
+                values.update((p.group(1), p.group(2)) for p in pairs)
+                continue
+            if words[:1] == ["for"] and len(words) > 2 and words[2] == "in":
+                values[words[1]] = next((w for w in words[3:] if own(w) or settings and settings_named(w, cwd)),
+                                        " ".join(words[3:]))
+                continue
+            c = command_index(words)
+            head = base(str(cmd["sub"])) if cmd.get("sub") else base(words[c]) if c < len(words) else ""
+            targets = words[-1:] if head in COPIERS else words
+            redirects = [spelled(t) for op, t in cmd["redir"] if ">" in op]
+            names_own = any(name in w for w in words for name in files) or settings and (
+                any("user" in settings_named(w, cwd) for w in targets) or into_settings_dir(words[c + 1:], cwd))
+            if any(own(t) for t in redirects) or (names_own and head not in VIEWERS | PRINTERS):
+                return text("protect")
+            if head not in VIEWERS and any(word in w for w in words for word in switch_words):
+                return text("protect")
+            # `jq '.disableAllHooks = true' .claude/settings.json > x && mv x .claude/settings.json`
+            if switched and (any(settings_named(t, cwd) for t in redirects) or
+                             head not in VIEWERS and any(settings_named(w, cwd) for w in targets)):
+                return text("protect")
+    return None
+
+
+# --- destructive policy ---
+
+def load_rules(path=RULES_FILE):
+    """The rules, with destructive-rules.local.json from the same directory merged in when it is there."""
+    with open(path) as f:
+        rules = json.load(f)
+    local = os.path.join(os.path.dirname(path), LOCAL_RULES)
+    if os.path.isfile(local) and os.path.realpath(local) != os.path.realpath(path):
+        with open(local) as f:
+            merge_rules(rules, json.load(f))
+    for key in ("bash", "mcp"):
+        if not isinstance(rules.get(key), list):
+            raise ValueError(f"{key} must be a list")
+    return rules
+
+
+def merge_rules(rules, local):
+    """Local rules extend the defaults: a rule with a known id replaces it, the other rules, lists and option tables
+    add up, messages and the remaining settings replace the defaults' own."""
+    for key, value in local.items():
+        if key in ("about", "version"):
+            continue
+        if key in ("bash", "mcp"):
+            known = {rule.get("id"): k for k, rule in enumerate(rules.setdefault(key, []))}
+            for rule in value:
+                if rule.get("id") in known:
+                    rules[key][known[rule["id"]]] = rule
+                else:
+                    rules[key].append(rule)
+        elif key == "global_value_options":
+            for head, options in value.items():
+                merged = rules.setdefault(key, {}).setdefault(head, [])
+                merged += [o for o in options if o not in merged]
+        elif key == "messages":
+            rules.setdefault(key, {}).update(value)
+        elif isinstance(value, list) and key != "deny_in_permission_modes":
+            merged = rules.setdefault(key, [])
+            merged += [v for v in value if v not in merged]
+        else:
+            rules[key] = value
+
+
+def configure(rules):
+    """What the rules add to the guard itself: launchers and its messages."""
+    LAUNCHERS.update(rules.get("launchers", []))
+    DASHDASH_LAUNCHERS.update(rules.get("launcher_options_end", []))
+    MESSAGES.update({k: v for k, v in rules.get("messages", {}).items() if k in MESSAGES and isinstance(v, str)})
+
+
+def text(key, **fields):
+    """One of the guard's messages; a broken replacement from the rules falls back to the built-in one."""
+    values = {"why": MESSAGES["codex_why"], "use": MESSAGES["codex_use"], **fields}
+    for template in (MESSAGES[key], DEFAULT_MESSAGES[key]):
+        try:
+            return template.format(**values)
+        except (KeyError, IndexError, ValueError, TypeError):
+            continue
+    return DEFAULT_MESSAGES[key]
+
+
+def split_args(head, args, rules):
+    """(positional words, option names, option values) of a command's arguments, up to `--`."""
+    takes = set(rules.get("global_value_options", {}).get(head, []))
+    pos, opts, values, k = [], set(), {}, 0
+    while k < len(args):
+        word = args[k]
+        k += 1
+        if word == "--":
+            break
+        if not word.startswith("-") or word == "-":
+            pos.append(word)
+            continue
+        name = word.split("=", 1)[0]
+        opts.add(name)
+        if not name.startswith("--") and len(name) > 2:
+            opts.update("-" + ch for ch in name[1:])
+        if "=" in word:
+            values[name] = word.split("=", 1)[1]
+        elif name in takes and k < len(args):
+            values[name] = args[k]
+            k += 1
+    return pos, opts, values
+
+
+def outside(path, ctx, script):
+    """True when a path argument leaves the session scratchpad; an unknown one counts only outside scripts."""
+    values = expand(path, ctx)
+    if values is None:
+        return not script
+    for value in values:
+        if value.startswith(TEMP):
+            continue
+        value = os.path.expanduser(value)
+        wild = re.search(r"[*?\[]", value)
+        if wild:
+            value = os.path.dirname(value[:wild.start()]) or "."
+        if ctx["cwd"] in (None, TEMP) and not os.path.isabs(value):
+            if script or ctx["cwd"] == TEMP:
+                continue
+            return True
+        real = os.path.realpath(os.path.join(ctx["cwd"] or "/", value))
+        if not any(real == root or real.startswith(root + os.sep) for root in ctx["roots"]):
+            return True
+    return False
+
+
+def sql_writes(sql, rules):
+    text = re.sub(r"\s+", " ", SQL_COMMENT.sub(" ", SQL_STRING.sub("''", sql)))
+    reads = set(rules.get("sql_read_statements", []))
+    safe = {s.upper() for s in rules.get("sql_safe_statements", [])}
+    for statement in text.split(";"):
+        statement = statement.strip()
+        # YQL `INSERT INTO @name` fills an anonymous table that lives only inside the query.
+        if not statement or statement.upper() in safe or re.match(r"insert (into|overwrite) @", statement, re.I):
+            continue
+        match = re.match(r"[(\s]*([A-Za-z$][A-Za-z0-9_$]*)", statement)
+        word = match.group(1).upper() if match else ""
+        # These only describe a statement: `EXPLAIN AST CREATE ...`, `SHOW CREATE TABLE ...`.
+        if word in ("EXPLAIN", "SHOW", "DESCRIBE", "DESC", "EXISTS"):
+            continue
+        if word and not word.startswith("$") and word not in reads:
+            return True
+        if SQL_WRITE.search(statement):
+            return True
+    return False
+
+
+def sql_word(word, ctx):
+    """A query argument: a whole `$Q` or `$(...)` is the shell's, anything else is SQL text ($x and `t` are YQL)."""
+    return expand(word, ctx) if re.fullmatch(r"\$\{?\w+\}?|\$\(.*\)", word, re.S) else [word]
+
+
+def sql_texts(rule, cmd, c, head, pos, ctx):
+    """Query texts a CLI call carries, and whether one of them is unknown until the shell runs. A rule's
+    sql_after_dashdash_with names a flag that makes the words after `--` the query (`cli --http -- 'SELECT 1'`)."""
+    words, cwd = cmd["words"], ctx["cwd"] or "/"
+    found = []
+    for k, word in enumerate(words[c + 1:], c + 1):
+        if word in ("--query", "-q") and k + 1 < len(words):
+            found.append(sql_word(words[k + 1], ctx))
+        elif word.startswith("--query="):
+            found.append(sql_word(word.split("=", 1)[1], ctx))
+        elif word == "--queries-file" and k + 1 < len(words):
+            files = expand(words[k + 1], ctx)
+            found.append([read_text(f, ctx, cwd) for f in files] if files else None)
+    if head == "yt" and pos[:1] in (["start-query"], ["query"]):
+        found += [sql_word(p, ctx) for p in pos[2:3]]
+    if rule.get("sql_after_dashdash_with") in words and "--" in words:
+        found += [sql_word(w, ctx) for w in words[words.index("--") + 1:] if not w.startswith("-")]
+    if cmd["pipe"] or any(op in ("<", "<<", "<<<") for op, _ in cmd["redir"]):
+        fed = fed_text(cmd, cwd, ctx)
+        found.append([fed] if fed is not None else None)
+    texts = [t for values in found if values for t in values if t]
+    return texts, any(values is None or None in values for values in found)
+
+
+# git push: the options that take a value, and the mark of a destination the guard cannot tell.
+PUSH_VALUE_OPTS = {"--repo", "--receive-pack", "--exec", "-o", "--push-option"}
+UNKNOWN = "?"
+
+
+def git_read(repo, settings, *args):
+    """(exit code, output) of a read-only git command in a repository, with the push's own settings."""
+    try:
+        run = subprocess.run(["git", "-C", repo, *settings, *args], capture_output=True, text=True, timeout=3,
+                             stdin=subprocess.DEVNULL, env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
+        return run.returncode, run.stdout
+    except (OSError, subprocess.SubprocessError):
+        return -1, ""
+
+
+def push_info(cmd, c, ctx):
+    """What a `git push` may update, from its words and the repository's config (read-only): dests (branch names,
+    "*" for every branch, UNKNOWN when the guard cannot tell), specs (the refspecs in effect), tags (it sends
+    tags), url (the remote's URL), repo (the repository directory, None when unknown)."""
+    if "push" in cmd:
+        return cmd["push"]
+    words, takes = cmd["words"], set(ctx["rules"].get("global_value_options", {}).get("git", []))
+    k, dirs, settings = c + 1, [], []
+    while k < len(words) and words[k] != "push":
+        name, eq, value = words[k].partition("=")
+        if name in takes and not eq:
+            k += 1
+            value = words[k] if k < len(words) else ""
+        if name == "-C":
+            dirs.append(value)
+        elif name == "-c" and re.match(r"(?i)(push|remote|branch)\.", value):
+            settings += ["-c", value]
+        elif name in ("--git-dir", "--work-tree"):
+            settings.append(f"{name}={value}")
+        k += 1
+    opts, args, remote, k = set(), [], None, k + 1
+    while k < len(words):
+        word = words[k]
+        k += 1
+        if word == "--":
+            args += words[k:]
+            break
+        if not word.startswith("-") or word == "-":
+            args.append(word)
+            continue
+        name, eq, value = word.partition("=")
+        if name in PUSH_VALUE_OPTS and not eq and k < len(words):
+            value, k = words[k], k + 1
+        if name == "--repo":
+            remote = value  # the <repository> argument wins over it
+        opts.add(name)
+        if not name.startswith("--"):
+            opts.update("-" + ch for ch in name[1:])
+    unknown, refs = False, []
+    if args:
+        found = expand(args[0], ctx)
+        unknown, remote = not found or len(found) != 1, found[0] if found and len(found) == 1 else None
+    for word in args[1:]:
+        found = expand(word, ctx)
+        unknown |= found is None
+        refs += found or []
+    repo, cwd, parts = None, ctx["cwd"], [expand(d, ctx) for d in dirs]
+    if all(p and len(p) == 1 for p in parts):
+        parts = [os.path.expanduser(p[0]) for p in parts]
+        if cwd not in (None, TEMP) or parts and os.path.isabs(parts[0]):
+            repo = os.path.realpath(os.path.join(cwd if cwd not in (None, TEMP) else "/", *parts))
+    branch, config, local_tags = None, {}, set()
+    if repo:
+        code, out = git_read(repo, settings, "symbolic-ref", "-q", "--short", "HEAD")
+        branch = out.strip() if code == 0 else None
+        if code in (0, 1):
+            code, out = git_read(repo, settings, "config", "-z", "--list")
+            for entry in out.split("\0") if code == 0 else []:
+                key, _, value = entry.partition("\n")
+                config.setdefault(key, []).append(value)
+            if any(not r.lstrip("+").startswith("refs/") for r in refs):
+                code, out = git_read(repo, settings, "for-each-ref", "--format=%(refname:short)", "refs/tags")
+                local_tags = set(out.split()) if code == 0 else set()
+
+    def get(key):
+        return (config.get(key) or [""])[-1]
+
+    def true(key):
+        return key in config and get(key).lower() in ("", "true", "yes", "on", "1")
+
+    if remote is None and not unknown:
+        remote = get(f"branch.{branch}.pushremote") or get("remote.pushdefault") or get(f"branch.{branch}.remote") \
+            or "origin"
+    remote = remote or ""
+    # Where the push really goes: pushurl, url.<base>.insteadOf and pushInsteadOf applied by git itself.
+    code, out = git_read(repo, settings, *(("ls-remote", "--get-url", remote) if re.search(r"[/:]", remote) else
+                                           ("remote", "get-url", "--push", remote))) if repo and remote else (1, "")
+    url = out.strip() if code == 0 and out.strip() else remote if re.search(r"[/:]", remote) else \
+        get(f"remote.{remote}.pushurl") or get(f"remote.{remote}.url")
+    upstream = get(f"branch.{branch}.merge") if branch else ""
+    current = {branch or UNKNOWN} | ({upstream.replace("refs/heads/", "", 1)} if upstream else set())
+    tags = bool(opts & {"--tags", "--follow-tags"}) or true("push.followtags") and "--no-follow-tags" not in opts
+    explicit, j = [], 0
+    while j < len(refs):
+        if refs[j] == "tag":  # `git push origin tag v1`
+            tags, j = True, j + 2
+            continue
+        explicit.append(refs[j])
+        j += 1
+    dests = {UNKNOWN} if unknown or repo is None else set()
+    every = opts & {"--all", "--branches", "--mirror"} or true(f"remote.{remote}.mirror")
+    if every:
+        dests.add("*")
+    specs = explicit or config.get(f"remote.{remote}.push", [])
+    if not specs and not every:
+        mode = get("push.default").lower() or "simple"
+        if mode == "matching":
+            dests.add("*")
+        elif mode != "nothing":
+            dests |= current
+    for spec in specs:
+        src, colon, dst = spec.lstrip("+").partition(":")
+        dst = dst or src
+        if not dst:
+            dests.add("*")  # `:` pushes the matching branches
+        elif dst in ("HEAD", "@"):
+            dests |= current
+        elif dst.startswith("refs/tags/") or not colon and src in local_tags:
+            tags = True
+        elif not dst.startswith("refs/") or dst.startswith("refs/heads/"):
+            name = dst.replace("refs/heads/", "", 1)
+            dests.add("*" if "*" in name else name)
+    cmd["push"] = {"dests": dests, "specs": specs, "tags": tags, "url": url, "repo": repo}
+    return cmd["push"]
+
+
+def bash_rule(rule, cmd, c, ctx, script):
+    """True when a simple command matches a bash rule."""
+    words = cmd["words"]
+    if "launcher" in rule:
+        return any(base(w) in rule["launcher"] for w in words[:c])
+    if c >= len(words):
+        return False
+    head = base(words[c])
+    if head not in rule.get("command", []):
+        return False
+    rules = ctx["rules"]
+    pos, opts, values = split_args(head, words[c + 1:], rules)
+    if "sub" in rule or "sub_regex" in rule:
+        first = pos[0] if pos else ""
+        if first not in rule.get("sub", []) and not (rule.get("sub_regex") and re.search(rule["sub_regex"], first)):
+            return False
+    if "sub_not" in rule and pos and pos[0] in rule["sub_not"]:
+        return False
+    if "sub2" in rule and (len(pos) < 2 or pos[1] not in rule["sub2"]):
+        return False
+    if "flags_any" in rule and not opts & set(rule["flags_any"]):
+        return False
+    if any(not opts & set(group) for group in rule.get("flags_all", [])):
+        return False
+    push = push_info(cmd, c, ctx) if head == "git" and pos[:1] == ["push"] else None
+    # For git push the refspecs in effect: the command's own, or the remote's configured ones.
+    if "arg_prefix_any" in rule and not any(p.startswith(tuple(rule["arg_prefix_any"]))
+                                            for p in (push["specs"] if push else pos[1:] or pos)):
+        return False
+    if "require_user" in rule and (values.get("-u") or values.get("--user")) in rule["require_user"]:
+        return False
+    # `gh repo edit --visibility public`: an option with one of these values (the option takes a value per
+    # global_value_options, or comes as --option=value).
+    if "option_values_any" in rule and not any(values.get(option) in wanted
+                                               for option, wanted in rule["option_values_any"].items()):
+        return False
+    if "push_url_regex" in rule and not (push and re.search(rule["push_url_regex"], push["url"] or "")):
+        return False
+    repo = os.path.realpath(os.path.join(ctx["cwd"] or "/", os.path.expanduser(values.get("-C", "."))))
+    if "repo_name_any" in rule and not any(name in repo or push and name in f"{push['repo']} {push['url']}"
+                                           for name in rule["repo_name_any"]):
+        return False
+    if "push_to_branches" in rule and not (push and push["dests"] & {*rule["push_to_branches"], "*", UNKNOWN}):
+        return False
+    if rule.get("push_tags") and not (push and push["tags"]):
+        return False
+    if rule.get("outside_scratchpad"):
+        if any(base(w) == "xargs" for w in words[:c]):
+            if script:
+                return False
+        else:
+            if head == "find":
+                paths = []
+                for word in words[c + 1:]:
+                    if word.startswith(("-", "(", "!")):
+                        break
+                    paths.append(word)
+                paths = paths or ["."]
+            else:
+                paths = pos
+            if not any(outside(p, ctx, script) for p in paths):
+                return False
+    if rule.get("sql"):
+        texts, unknown = sql_texts(rule, cmd, c, head, pos, ctx)
+        if not any(sql_writes(t, rules) for t in texts) and not (unknown and not script):
+            return False
+    return True
+
+
+FUNCTION = re.compile(r"(?:^|[;&|\n])\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{|"
+                      r"(?:^|[;&|\n])\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{")
+
+
+def functions(text):
+    """Shell function definitions cut out of a text: (text without them, {name: body})."""
+    found, out, last = {}, [], 0
+    for match in FUNCTION.finditer(text):
+        if match.start() < last:
+            continue
+        depth, k, quote = 1, match.end(), None
+        while k < len(text) and depth:
+            ch = text[k]
+            if quote:
+                if ch == "\\" and quote == '"':
+                    k += 1
+                elif ch == quote:
+                    quote = None
+            elif ch in "'\"":
+                quote = ch
+            else:
+                depth += {"{": 1, "}": -1}.get(ch, 0)
+            k += 1
+        found[match.group(1) or match.group(2)] = text[match.end():k - 1]
+        out.append(text[last:match.start() + (1 if text[match.start()] in ";&|\n" else 0)] + " :")
+        last = k
+    return "".join(out) + text[last:], found
+
+
+def call_body(body, args):
+    """A function body with the call's arguments in place of $1..$9, $@ and $*."""
+    def arg(match):
+        name = match.group(1) or match.group(2)
+        if name in ("@", "*"):
+            return " ".join(shlex.quote(a) for a in args)
+        n = int(name)
+        return shlex.quote(args[n - 1]) if 0 < n <= len(args) else "''"
+    return re.sub(r"\"?\$(?:\{([0-9@*])(?::-[^}]*)?\}|([0-9@*]))\"?", arg, body)
+
+
+def destructive_reason(text, ctx, depth=0, script=False):
+    """(rule, command words) of the first destructive simple command in a shell text, or None."""
+    if depth > 3:
+        return None
+    text, defined = functions(text)
+    ctx.setdefault("funcs", {}).update(defined)
+    heads = ctx.setdefault("heads", set())
+    try:
+        commands = parse(text)
+        for body in defined.values():
+            heads.update(base(c["words"][command_index(c["words"])]) for c in parse(body)
+                         if command_index(c["words"]) < len(c["words"]))
+    except ValueError:
+        return None
+    for cmd in commands:
+        words = cmd["words"]
+        if cmd.get("sub"):
+            heads.add(base(str(cmd["sub"])))
+        # Substitutions inside quotes, checked in order so the variables assigned before them are known.
+        for match in SUBST.finditer(" ".join(words)):
+            found = destructive_reason(match.group(1) or match.group(2) or "", dict(ctx, vars=dict(ctx["vars"])),
+                                       depth + 1, script)
+            if found:
+                return found
+        if track(words, ctx):
+            continue
+        remember(cmd, ctx)
+        c = command_index(words)
+        if c < len(words):
+            heads.add(base(words[c]))
+        if c < len(words) and words[c] in ctx.get("funcs", {}):
+            found = destructive_reason(call_body(ctx["funcs"][words[c]], words[c + 1:]), dict(ctx, vars=dict(ctx["vars"])),
+                                       depth + 1, script)
+            if found:
+                return found
+            continue
+        for rule in ctx["rules"]["bash"]:
+            if bash_rule(rule, cmd, c, ctx, script):
+                return rule, words
+        if c >= len(words):
+            continue
+        for inner in nested(cmd, c, ctx["cwd"] or "/"):
+            found = destructive_reason(inner, dict(ctx, vars=dict(ctx["vars"])), depth + 1, script)
+            if found:
+                return found
+        path, body, shellish = script_body(cmd, c, ctx["cwd"] or "/")
+        if body is not None and shellish:
+            found = destructive_reason(body, dict(ctx, vars={}), depth + 1, True)
+            if found:
+                return found
+    return None
+
+
+def remember(cmd, ctx):
+    """Keep the text an echo, printf or cat-from-heredoc writes to a file, for later commands of the same text."""
+    words = cmd["words"]
+    c = command_index(words)
+    head = base(words[c]) if c < len(words) else ""
+    targets = [t for op, t in cmd["redir"] if op in (">", ">>", ">|")]
+    if not targets or head not in ("cat", "echo", "printf"):
+        return
+    text = fed_text(cmd, ctx["cwd"] or "/", ctx) if head == "cat" else \
+        " ".join(w for w in words[c + 1:] if not w.startswith("-"))
+    for target in targets:
+        names = expand(target, ctx)
+        if names and len(names) == 1 and text is not None and ctx["cwd"] not in (None, TEMP):
+            ctx.setdefault("files", {})[os.path.realpath(os.path.join(ctx["cwd"], os.path.expanduser(names[0])))] = text
+
+
+def track(words, ctx):
+    """Record what assignments, `for NAME in` and `cd` change for later commands; True when that is all it does."""
+    names = words[1:] if words[:1] in (["export"], ["local"], ["typeset"], ["declare"], ["readonly"]) else words
+    pairs = [re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", w, re.S) for w in names]
+    if names and all(pairs):
+        for pair in pairs:
+            ctx["vars"][pair.group(1)] = expand(pair.group(2), ctx)
+        return True
+    if words[:1] == ["for"] and len(words) >= 3 and words[2] == "in":
+        values = []
+        for word in words[3:]:
+            options = expand(word, ctx)
+            if options is None:
+                values = None
+                break
+            for value in options:
+                matches = sorted(glob.glob(os.path.join(ctx["cwd"] or "/", value))) if re.search(r"[*?\[]", value) else []
+                values += matches or [value]
+        ctx["vars"][words[1]] = values[:32] if values is not None else None
+        return True
+    if words[:1] == ["cd"]:
+        target = expand(words[1] if len(words) > 1 else "~", ctx)
+        path = os.path.expanduser(target[0]) if target and len(target) == 1 else None
+        if path is None:
+            ctx["cwd"] = None
+        elif path.startswith(TEMP):
+            ctx["cwd"] = TEMP
+        elif os.path.isabs(path) or ctx["cwd"] not in (None, TEMP):
+            ctx["cwd"] = os.path.realpath(os.path.join(ctx["cwd"] or "/", path))
+        else:
+            ctx["cwd"] = None
+        return True
+    return False
+
+
+def field(data, path, default=None):
+    for part in path.split("."):
+        if not isinstance(data, dict) or part not in data:
+            return default
+        data = data[part]
+    return data
+
+
+def mcp_rule(rule, tool, data, rules):
+    if not re.search(rule["tool"], tool):
+        return False
+    when = rule.get("when")
+    if when:
+        value = field(data, when["field"], when.get("default"))
+        if "nonempty" in when and bool(value) != when["nonempty"]:
+            return False
+        if "equals" in when and value != when["equals"]:
+            return False
+    if "sql_field" in rule:
+        sql = field(data, rule["sql_field"])
+        if isinstance(sql, str) and not sql_writes(sql, rules):
+            return False
+    return True
+
+
+def scratch_roots(rules, session):
+    roots = []
+    if re.match(r"^[A-Za-z0-9-]+$", session):
+        for pattern in rules.get("scratchpad_globs", []):
+            roots += glob.glob(pattern.format(uid=os.getuid(), session_id=session))
+    return [os.path.realpath(r) for r in roots]
+
+
+def decide_destructive(event, env, rules_path=RULES_FILE, rules=None):
+    """(decision, message) under the destructive policy, or None to let the call through."""
+    if env.get("AGENT_DESTRUCTIVE_GUARD", "").lower() in ("off", "0", "false") or fresh(DESTRUCTIVE_FLAG):
+        return None
+    try:
+        rules = rules or load_rules(rules_path)
+    except (OSError, ValueError) as error:
+        return "warn", f"agent-worker-guard: cannot read the rules {rules_path} ({error}); the destructive-action guard is off"
+    tool, data = event.get("tool_name", ""), event.get("tool_input") or {}
+    found = None
+    if tool in ("Bash", "mcp__terminal__run_in_terminal"):
+        roots = scratch_roots(rules, str(event.get("session_id") or ""))
+        if event.get("scratchpad_dir"):
+            roots.append(os.path.realpath(str(event["scratchpad_dir"])))
+        ctx = {"rules": rules, "cwd": event.get("cwd") or os.getcwd(), "vars": {}, "env": env, "roots": roots,
+               "heads": set()}
+        command = str(data.get("command") or "")
+        hit = destructive_reason(command, ctx)
+        if hit:
+            found = hit[0], " ".join(hit[1])[:200]
+        else:
+            # Safety net: a command the rules watch shows up in the raw text, but the parser never saw it run.
+            watched = {h for r in rules["bash"] for h in r.get("command", []) + r.get("launcher", [])} | {"codex"}
+            missed = sorted((raw_heads(command) & watched) - ctx["heads"])
+            if missed:
+                found = {"id": "unparsed-command", "why": text("fallback", heads=", ".join(missed))}, command[:200]
+    elif tool.startswith("mcp__"):
+        rule = next((r for r in rules["mcp"] if mcp_rule(r, tool, data, rules)), None)
+        if rule:
+            found = rule, tool
+    if not found:
+        return None
+    rule, what = found
+    decision = rules.get("decision", "ask")
+    if event.get("permission_mode") in rules.get("deny_in_permission_modes", []):
+        decision = "deny"
+    message = rules.get("ask_message" if decision == "ask" else "message", "")
+    return decision, text("rule", message=message, id=rule["id"], why=rule["why"], what=what)
+
+
+def respond(decision, reason):
+    if decision == "warn":
+        json.dump({"systemMessage": reason}, sys.stdout, ensure_ascii=False)
+    else:
+        json.dump({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                          "permissionDecisionReason": reason}}, sys.stdout, ensure_ascii=False)
+
+
+# --- self-test ---
+
+CODEX_CASES = [
+    ("Bash", "codex exec 'fix it'", True),
+    ("Bash", "cd /x && codex exec --sandbox read-only -C . -", True),
+    ("Bash", "codex -c model=o3 e hi", True),
+    ("Bash", "CODEX_HOME=/tmp/x /opt/homebrew/bin/codex review", True),
+    ("Bash", "timeout 60 codex exec x", True),
+    ("Bash", "env -i HOME=$HOME codex app-server", True),
+    ("Bash", "npx -y @openai/codex exec hi", True),
+    ("Bash", "echo hi | xargs codex exec", True),
+    ("Bash", "perl -e 'alarm 9; exec @ARGV' codex exec x", True),
+    ("Bash", "bash -c \"codex exec x\"", True),
+    ("Bash", "zsh -lc 'cd /x; codex review'", True),
+    ("Bash", "out=$(codex exec x)", True),
+    ("Bash", "echo \"$(codex exec x)\"", True),
+    ("Bash", "echo `codex exec x`", True),
+    ("Bash", "eval 'codex exec x'", True),
+    ("Bash", "codex 'please fix the tests'", True),
+    ("Bash", "codex", True),
+    ("Bash", "codex resume --last", True),
+    ("Bash", "codex debug app-server send", True),
+    ("Bash", "node ~/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs task --write fix", True),
+    ("Bash", "node \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs\" review --base main", True),
+    ("Bash", "node /p/scripts/codex-companion.mjs setup --enable-review-gate", True),
+    ("Bash", "node /p/scripts/app-server-broker.mjs serve --endpoint unix:/tmp/s", True),
+    ("Bash", "zsh <<'EOF'\ncodex exec x\nEOF", True),
+    ("Bash", "cat <<'EOF' | bash\ncodex exec x\nEOF", True),
+    ("Bash", "echo 'codex exec x' | sh", True),
+    ("Bash", "python3 -c \"import subprocess; subprocess.run(['codex', 'exec', 'x'])\"", True),
+    ("Bash", "node -e \"require('child_process').spawnSync('codex', ['exec', 'x'])\"", True),
+    ("Bash", "find . -name '*.md' -exec codex exec {} \\;", True),
+    ("Bash", "\"$HOME/.local/bin/codex\" exec x", True),
+    ("Bash", "/usr/bin/env CODEX_HOME=/x codex review --uncommitted", True),
+    ("Bash", "if true; then codex exec x; fi", True),
+    ("Bash", "for f in a b; do codex exec \"$f\"; done", True),
+    ("mcp__terminal__run_in_terminal", "codex exec x", True),
+    ("Agent", {'subagent_type': 'codex:codex-rescue', 'prompt': 'x'}, True),
+    ("Bash", "~/.local/bin/agent-worker research -C . 'why does codex exec fail on resume'", False),
+    ("Bash", "agent-worker research -C /x --access edit - <<'EOF'\nRun codex exec --help and explain.\nEOF", False),
+    ("Bash", "codex --version", False),
+    ("Bash", "codex exec --help", False),
+    ("Bash", "codex mcp list --json", False),
+    ("Bash", "codex features list", False),
+    ("Bash", "codex login status", False),
+    ("Bash", "codex sandbox -- ls", False),
+    ("Bash", "which codex && command -v codex", False),
+    ("Bash", "brew info codex; npm ls -g @openai/codex", False),
+    ("Bash", "git log --grep codex", False),
+    ("Bash", "grep -rn 'codex exec' ~/notes", False),
+    ("Bash", "rg codex-companion.mjs ~/.claude/plugins", False),
+    ("Bash", "sed -n '1,40p' ~/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs", False),
+    ("Bash", "node /p/scripts/codex-companion.mjs status", False),
+    ("Bash", "cat > notes.md <<'EOF'\nDo not run codex exec directly.\nEOF", False),
+    ("Bash", "ls -la ~/.codex && cat ~/.codex/config.toml | head", False),
+    ("Bash", "pgrep -fl app-server-broker.mjs", False),
+    ("Bash", "echo 'codex exec' # comment codex exec", False),
+    ("Bash", "git status && make test", False),
+    ("Bash", "python3 -c 'print(1)' && node -e 'console.log(2)'", False),
+    ("Bash", "echo hi > codex; cat ~/.codex/config.toml", False),
+    ("Bash", "ps -axo pid,command | grep -E 'codex (exec|app-server)'", False),
+    ("Agent", {'subagent_type': 'general-purpose', 'prompt': 'codex exec'}, False),
+    ("Read", {'file_path': '/x/codex-companion.mjs'}, False),
+    # `#` inside a word is not a comment: the rest of the line still counts. A real comment does not.
+    ("Bash", "[[ ${#x} -gt 0 ]] && codex exec \"fix it\"", True),
+    ("Bash", "echo ${#x}; codex exec x", True),
+    ("Bash", "ls # codex exec x", False),
+]
+
+PROTECT_CASES = [
+    ("Bash", "touch ~/.config/agent-worker-router/allow-direct-codex", True),
+    ("Bash", "touch ~/.config/agent-worker-router/allow-destructive", True),
+    ("Bash", "jq '.bash = []' x > ~/.config/agent-worker-router/destructive-rules.json", True),
+    ("Bash", "sed -i '' '/rm-recursive/d' ~/.config/agent-worker-router/destructive-rules.json", True),
+    ("Write", {"file_path": "/Users/u/.config/agent-worker-router/allow-direct-codex", "content": ""}, True),
+    ("Edit", {"file_path": "/Users/u/.config/agent-worker-router/destructive-rules.json"}, True),
+    ("Bash", "cat ~/.config/agent-worker-router/destructive-rules.json", False),
+    ("Bash", "jq '.bash | length' ~/.config/agent-worker-router/destructive-rules.json", False),
+    ("Write", {"file_path": "/tmp/notes.md", "content": "allow-destructive"}, False),
+    ("Write", {"file_path": "/Users/u/.config/agent-worker-router/destructive-rules.local.json", "content": "{}"}, True),
+    ("Bash", "jq '.bash = []' x > ~/.config/agent-worker-router/destructive-rules.local.json", True),
+    ("Bash", "cat ~/.config/agent-worker-router/destructive-rules.local.json", False),
+    ("Bash", "[[ ${#x} -gt 0 ]] && touch ~/.config/agent-worker-router/allow-destructive", True),
+]
+
+# The guard's own settings. {SET} is a user settings file with the guard's hook entry, {CFG} its directory, {D} the
+# working directory, whose .claude/ holds the project settings.
+SETTINGS_FIXTURE = {
+    "env": {"X": "1"},
+    "permissions": {"allow": ["Bash(ls)"]},
+    "hooks": {"PreToolUse": [{"matcher": "Bash|mcp__.*", "hooks": [
+        {"type": "command", "command": "/u/.local/bin/agent-worker-guard --all", "timeout": 10}]}]},
+}
+SETTINGS_CASES = [
+    ("Edit", {"file_path": "{SET}", "old_string": '"Bash(ls)"', "new_string": '"Bash(ls)", "Bash(pwd)"'}, False),
+    ("Edit", {"file_path": "{SET}", "old_string": '"X": "1"', "new_string": '"X": "2"'}, False),
+    ("Edit", {"file_path": "{SET}", "old_string": "not in the file", "new_string": "x"}, False),
+    ("Write", {"file_path": "{SET}", "content": json.dumps(dict(SETTINGS_FIXTURE, permissions={}))}, False),
+    ("Edit", {"file_path": "{SET}", "old_string": "/u/.local/bin/agent-worker-guard --all",
+              "new_string": "/usr/bin/true"}, True),
+    ("Edit", {"file_path": "{SET}", "old_string": '"Bash|mcp__.*"', "new_string": '"Read"'}, True),
+    ("Edit", {"file_path": "{SET}", "old_string": '"timeout": 10', "new_string": '"timeout": 1'}, True),
+    ("Edit", {"file_path": "{SET}", "old_string": '"X": "1"',
+              "new_string": '"X": "1", "AGENT_DESTRUCTIVE_GUARD": "off"'}, True),
+    ("Edit", {"file_path": "{SET}", "old_string": '{\n  "env"', "new_string": '{\n  "disableAllHooks": true,\n  "env"'},
+     True),
+    ("Edit", {"file_path": "{SET}", "old_string": "agent-worker-guard", "new_string": "true", "replace_all": True}, True),
+    ("MultiEdit", {"file_path": "{SET}", "edits": [{"old_string": '"Bash(ls)"', "new_string": '"Bash(pwd)"'},
+                                                   {"old_string": '"timeout": 10', "new_string": '"timeout": 20'}]},
+     True),
+    ("Write", {"file_path": "{SET}", "content": "{}"}, True),
+    ("Write", {"file_path": "{SET}", "content": '{"hooks": '}, True),
+    ("Write", {"file_path": "{D}/.claude/settings.local.json", "content": '{"permissions": {"allow": ["Bash(ls)"]}}'},
+     False),
+    ("Write", {"file_path": "{D}/notes/settings.json", "content": '{"disableAllHooks": true}'}, False),
+    ("Write", {"file_path": "{D}/.claude/settings.json", "content": '{"disableAllHooks": true}'}, True),
+    ("Write", {"file_path": "{D}/.claude/settings.local.json", "content": '{"env": {"AGENT_WORKER_GUARD": "off"}}'},
+     True),
+    ("Bash", "cat {SET}", False),
+    ("Bash", "jq '.hooks.PreToolUse' {SET}", False),
+    ("Bash", "cat {SET} | jq .permissions && ls -la {CFG}", False),
+    ("Bash", "grep -rn disableAllHooks {CFG}", False),
+    ("Bash", "cp {SET} {SET}.bak && rm {SET}.bak", False),
+    ("Bash", "git add .claude/settings.json && git diff -- .claude/settings.local.json", False),
+    ("Bash", "F={SET}; ls -l \"$F\" && jq .hooks \"$F\"", False),
+    ("Bash", "for f in {SET} {CFG}/other.json; do grep -c x \"$f\"; done", False),
+    ("Bash", "echo \"=== {SET}: top-level keys\"", False),
+    ("Bash", "F={SET}; [ -L \"$F\" ] || print -r -- \"$F\"; diff <(jq -S . \"$F\") <(jq -S . {SET}.bak) > /dev/null", False),
+    ("Bash", "mv {SET} <(cat /dev/null)", True),
+    ("Bash", "F={SET}; jq 'del(.hooks)' \"$F\" > \"$F.tmp\" && mv \"$F.tmp\" \"$F\"", True),
+    ("Bash", "for f in {SET}; do jq . \"$f\" > \"$f\"; done", True),
+    ("Bash", "jq '.disableAllHooks = true' .claude/settings.json > /tmp/x && mv /tmp/x .claude/settings.json", True),
+    ("Bash", "echo AGENT_DESTRUCTIVE_GUARD=off >> ~/.zshenv", True),
+    ("Bash", "jq '.disableAllHooks = true' {SET} > /tmp/s && mv /tmp/s {SET}", True),
+    ("Bash", "jq '.permissions = {}' {SET} > {SET}", True),
+    ("Bash", "cp {SET}.bak {SET}", True),
+    ("Bash", "sed -i '' 's/agent-worker-guard/true/' {SET}", True),
+    ("Bash", "python3 -c \"open('{SET}', 'w').write('{}')\"", True),
+    ("Bash", "cd {CFG} && mv /tmp/s settings.json", True),
+    ("Bash", "cp /tmp/settings.json {CFG}/", True),
+    ("Bash", "echo x | tee {SET}", True),
+    ("Bash", "echo '{\"disableAllHooks\": true}' > .claude/settings.local.json", True),
+    ("Bash", "export AGENT_DESTRUCTIVE_GUARD=off", True),
+    ("Bash", "AGENT_WORKER_GUARD=off claude -p x", True),
+]
+
+# Destructive policy. {S} is the session scratchpad, {O} a directory outside it.
+SAFE = [
+    "ls -la",
+    "cat README.md",
+    "git status",
+    "git log --oneline -5",
+    "git diff HEAD~1",
+    "git branch -a",
+    "git branch -vv",
+    "git push -u origin feature-x",
+    "git push origin HEAD:feature-x",
+    "git fetch --all",
+    "git pull --rebase",
+    "git checkout -b x",
+    "git stash",
+    "git stash list",
+    "git stash pop",
+    "git reset HEAD~1",
+    "git reset --soft HEAD~1",
+    "git clean -n",
+    "git tag v1.2",
+    "git reflog",
+    "git gc",
+    "rm notes.txt",
+    "rm -rf {S}/build",
+    "rm -r {S}/tmp/a {S}/tmp/b",
+    "cd {S} && rm -rf {S}/x",
+    "find . -name '*.py'",
+    "find {O} -type f | wc -l",
+    "find {S} -name '*.log' -delete",
+    "clickhouse client -q 'SELECT 1'",
+    "clickhouse local -q 'CREATE TABLE t (x Int8) ENGINE=Memory'",
+    "yt list //home",
+    "yt get //home/x/@schema",
+    "yt read-table //t --format json",
+    "yt exists //x",
+    "yt start-query yql 'PRAGMA yt.Pool = \"x\"; $a = SELECT 1; SELECT * FROM $a'",
+    "yt start-query yql 'INSERT INTO @tmp SELECT 1; SELECT * FROM @tmp'",
+    "yt get-query-result q1",
+    "yt list-operations",
+    "launchctl list",
+    "launchctl print gui/501/x",
+    "security list-keychains",
+    "kubectl get pods",
+    "diskutil list",
+    "diskutil apfs list",
+    "crontab -l",
+    "dd if=/dev/zero of={S}/x bs=1m count=1",
+    "echo 'rm -rf /'",
+    "grep -rn 'git push --force' .",
+    "cat <<'EOF' > {S}/notes.md\nrm -rf /\nyt remove //x\nEOF",
+    "printf '%s\\n' 'DROP TABLE x' > {S}/q.sql",
+    "python3 -m pytest -q",
+    "make test",
+    "curl -s https://example.com",
+    "env | sort",
+    "ps -ef | grep yt",
+    "yt start-query yql 'SELECT * FROM `//home/x` LIMIT 10'",
+    "yt find //home -name x",
+    "yt get-operation op1",
+    "yt select-rows 'x FROM [//t]'",
+    "yt list-jobs op1",
+    "git show HEAD",
+    "git blame x.py",
+    "git remote -v",
+    "git worktree list",
+    "git rev-parse --show-toplevel",
+    "git ls-files | head",
+    "git branch --show-current",
+    "git diff --stat main...HEAD",
+    "git log -p -1",
+    "rm -f {O}/file.txt",
+    "mkdir -p {O}/x && cp -r a {O}/x && mv {O}/x {O}/y",
+    "chmod +x {O}/run.sh",
+    "launchctl print-disabled gui/501",
+    "kubectl describe pod x",
+    "kubectl logs x",
+    "pgrep -fl node",
+    "kill 12345",
+    "security find-identity -v -p codesigning",
+    "crontab -l | grep x",
+    "~/.local/bin/agent-worker research -C . 'Reply OK'",
+    "T=$(mktemp -d); trap 'rm -rf \"$T\"' EXIT; rm -rf \"$T\"",
+    "T=$(mktemp -d /tmp/x.XXXX) && rm -rf \"$T/sub\"",
+    "for f in {S}/a {S}/b; do rm -rf \"$f\"; done",
+    "cd {S} && rm -rf build",
+    "export S={S}; rm -rf \"$S/x\"",
+    "clickhouse format < {S}/q.sql",
+    "clickhouse format --query 'CREATE TABLE t (x Int8) ENGINE = Memory'",
+    # Real comments stay comments; quoted or commented commands are not run.
+    "ls # rm -rf /", "git status # && git push --force", "grep -rn 'git push --force' .",
+    "echo ${#x} ${p#pre} https://example.com/#top",
+]
+DESTRUCTIVE = [
+    "rm -rf {O}/project",
+    "rm -rf ~",
+    "rm -rf \"$HOME/x\"",
+    "rm -r build",
+    "rm -fr {O}/a",
+    "rm --recursive --force {O}",
+    "/bin/rm -rf {O}/x",
+    "rm -rf {S}/../../escape",
+    "rm -rf $(cat list.txt)",
+    "ls | xargs rm -rf",
+    "find {O} -name '*.log' -delete",
+    "find {O} -exec rm -rf {} \\;",
+    "sudo ls",
+    "git push --force",
+    "git push -f origin feature",
+    "git push origin +feature",
+    "git push --delete origin x",
+    "git push origin :x",
+    "git push origin main",
+    "git push origin HEAD:master",
+    "git reset --hard HEAD~1",
+    "git branch -D x",
+    "git branch --delete x",
+    "git clean -fdx",
+    "git stash drop",
+    "git stash clear",
+    "git tag -d v1",
+    "git reflog expire --expire=now --all",
+    "git gc --prune=now",
+    "clickhouse client -q 'ALTER TABLE t DROP PARTITION 1'",
+    "clickhouse-client --query='RENAME TABLE a TO b'",
+    "yt remove //home/x",
+    "yt move //a //b",
+    "yt set //x/@a 1",
+    "yt create table //x",
+    "yt start-query yql 'INSERT INTO `//home/x` SELECT 1'",
+    "yt start-query yql 'DEFINE ACTION $a() AS INSERT INTO `//x` SELECT 1; END DEFINE; DO $a()'",
+    "launchctl bootstrap gui/501 x.plist",
+    "launchctl unload x.plist",
+    "security find-generic-password -s x -w",
+    "osascript -e 'beep'",
+    "pkill -f node",
+    "killall node",
+    "crontab -r",
+    "kubectl delete pod x",
+    "diskutil eraseDisk APFS X disk9",
+    "dd if=x of=/dev/disk9",
+    "bash -c 'rm -rf {O}/x'",
+    "echo 'rm -rf {O}/x' | bash",
+    "zsh <<'EOF'\nrm -rf {O}/x\nEOF",
+    "ssh host 'rm -rf /data'",
+    "eval 'yt remove //x'",
+    "out=$(yt remove //x)",
+    "env X=1 git push --force",
+    "T={O}/data; rm -rf \"$T\"",
+    "for f in {O}/a {O}/b; do rm -rf \"$f\"; done",
+    "cd {O} && rm -rf build",
+    "if true; then rm -rf {O}/x; fi",
+    "while read f; do rm -rf \"$f\"; done < list.txt",
+    "wipe() { rm -rf \"$1\"; }; wipe {O}/data",
+    # `#` inside a word is not a comment: the rest of the line still counts.
+    "x=(a b); [[ ${#x} -eq 2 ]] && rm -rf {O}/data", "echo ${#x}; git push --force origin main",
+    "v=${p#pre}; git reset --hard HEAD~3", "curl -s https://example.com/#top; git reset --hard HEAD~3",
+    "echo \"${#x}\"; git push --force origin main", "echo 'a # b'; rm -rf {O}/x",
+    # Safety net: the parser cannot read this line (an unclosed quote), but it runs a watched command.
+    "rm -rf {O}/data 'unclosed",
+]
+MCP_CASES = [
+    ("mcp__clickhouse__run_query", {'query': 'SELECT 1'}, False),
+    ("mcp__clickhouse__run_query", {'query': 'SHOW CREATE TABLE t'}, False),
+    ("mcp__clickhouse__run_query", {'query': 'DROP TABLE t'}, True),
+    ("mcp__clickhouse__run_query", {'query': 'INSERT INTO t VALUES (1)'}, True),
+    ("mcp__airflow__clear_dag_run", {'dag_id': 'd', 'dag_run_id': 'r'}, False),
+    ("mcp__airflow__clear_dag_run", {'dag_id': 'd', 'dag_run_id': 'r', 'dry_run': False}, True),
+    ("mcp__airflow__trigger_dag", {'dag_id': 'd'}, True),
+    ("mcp__airflow__get_dag_run", {'dag_id': 'd', 'dag_run_id': 'r'}, False),
+    ("mcp__airflow__list_dags", {}, False),
+    ("mcp__clickhouse__list_tables", {'database': 'x'}, False),
+    ("mcp__clickhouse-prod__run_query", {'query': 'TRUNCATE TABLE t'}, True),
+    ("mcp__jira__create_issue", {'summary': 'x'}, True),
+    ("mcp__jira__get_issue", {'issue_key': 'X-1'}, False),
+    ("mcp__gitlab__run_job", {'job_id': 1}, True),
+    ("mcp__gitlab__get_merge_request", {'iid': 1}, False),
+    ("mcp__confluence__update_page", {'page_id': '1'}, True),
+    ("mcp__confluence__get_page", {'page_id': '1'}, False),
+    ("mcp__ccd_session_mgmt__delete_session", {'session_id': 'x'}, True),
+]
+
+# git push. Repositories the self-test makes in {R}: name -> (current branch, config); origin is a local bare repo.
+GIT_REPOS = {
+    "feature": ("feature", [("branch.feature.remote", "origin"), ("branch.feature.merge", "refs/heads/feature")]),
+    "main": ("main", [("branch.main.remote", "origin"), ("branch.main.merge", "refs/heads/main")]),
+    "master": ("master", []),
+    "up-main": ("feature", [("branch.feature.remote", "origin"), ("branch.feature.merge", "refs/heads/main")]),
+    "current": ("feature", [("push.default", "current"), ("branch.feature.merge", "refs/heads/main")]),
+    "matching": ("feature", [("push.default", "matching")]),
+    "nothing": ("feature", [("push.default", "nothing")]),
+    "detached": ("feature", []),
+    "pushspec": ("feature", [("remote.origin.push", "refs/heads/*:refs/heads/*")]),
+    "pushspec-dev": ("feature", [("remote.origin.push", "refs/heads/feature:refs/heads/feature")]),
+    "mirror": ("feature", [("remote.origin.mirror", "true")]),
+    "pushremote": ("feature", [("branch.feature.pushRemote", "fork"), ("remote.fork.url", "/x/fork.git"),
+                               ("remote.fork.push", "refs/heads/feature:refs/heads/main")]),
+    "followtags": ("feature", [("push.followTags", "true")]),
+    "tagged": ("feature", []),
+    "other-repo": ("feature", []),
+    "other-url": ("feature", [("remote.origin.url", "git@git.example:team/other-repo.git")]),
+    # Remotes on a public host, for rules that ask there (directly, and through url.<base>.insteadOf).
+    "public-url": ("feature", [("remote.origin.url", "git@github.com:team/repo.git")]),
+    "insteadof": ("feature", [("url.git@github.com:.insteadOf", "gh:"), ("remote.origin.url", "gh:team/repo.git")]),
+}
+# (repository the push runs in, None for the self-test's directory; command; True when it must ask)
+GIT_PUSH_CASES = [
+    ("feature", "git push origin feature", False),
+    ("feature", "git push -u origin feature", False),
+    ("feature", "git push origin HEAD:refs/heads/dev-x", False),
+    ("feature", "git push origin main:feature", False),
+    ("feature", "git push -o ci.skip origin feature", False),
+    ("feature", "git push https://example.invalid/r.git feature", False),
+    ("feature", "git push origin HEAD", False),
+    ("feature", "git push origin @", False),
+    ("feature", "B=feature; git push origin \"$B\"", False),
+    ("feature", "git push origin main", True),
+    ("feature", "git push origin HEAD:main", True),
+    ("feature", "git push origin x:refs/heads/master", True),
+    ("feature", "git push origin 2839dbee:refs/heads/main", True),
+    ("feature", "git push origin feature main", True),
+    ("feature", "git push origin 'refs/heads/*:refs/heads/*'", True),
+    ("feature", "git push https://example.invalid/r.git main", True),
+    ("feature", "git push --dry-run origin main", True),
+    ("feature", "git push --all origin", True),
+    ("feature", "git push --branches origin", True),
+    ("feature", "git push --mirror origin", True),
+    ("feature", "git push origin :", True),
+    ("feature", "git -c push.default=matching push", True),
+    ("feature", "B=main; git push origin \"$B\"", True),
+    ("feature", "git push origin \"$UNSET_BRANCH\"", True),
+    ("feature", "git push \"$UNSET_REMOTE\" feature", True),
+    # destructive pushes, any branch
+    ("feature", "git push -f origin feature", True),
+    ("feature", "git push -uf origin feature", True),
+    ("feature", "git push --force-with-lease origin feature", True),
+    ("feature", "git push --force-with-lease=feature:abc origin feature", True),
+    ("feature", "git push --force-if-includes origin feature", True),
+    ("feature", "git push origin +feature", True),
+    ("feature", "git push --delete origin feature", True),
+    ("feature", "git push -d origin feature", True),
+    ("feature", "git push origin :feature", True),
+    ("feature", "git push --prune origin 'refs/heads/*:refs/heads/*'", True),
+    # tags
+    ("feature", "git push --tags", True),
+    ("feature", "git push --follow-tags origin feature", True),
+    ("feature", "git push origin refs/tags/v1", True),
+    ("feature", "git push origin tag v1", True),
+    ("tagged", "git push origin v1.0", True),
+    ("followtags", "git push origin feature", True),
+    ("followtags", "git push --no-follow-tags origin feature", False),
+    # no refspec: the current branch, its upstream, push.default, the remote's push refspecs
+    ("feature", "git push", False),
+    ("feature", "git push origin", False),
+    ("nothing", "git push", False),
+    ("pushspec-dev", "git push", False),
+    ("main", "git push", True),
+    ("master", "git push origin", True),
+    ("up-main", "git push", True),
+    ("current", "git push", True),
+    ("matching", "git push origin", True),
+    ("detached", "git push origin", True),
+    ("pushspec", "git push", True),
+    ("mirror", "git push origin", True),
+    ("pushremote", "git push", True),
+    ("plain", "git push", True),
+    # where the push runs
+    (None, "git -C {R}/feature push", False),
+    ("main", "cd {R}/feature && git push", False),
+    (None, "git -C {R}/main push", True),
+    (None, "cd {R}/main && git push", True),
+    (None, "cd \"$NOWHERE\" && git push origin feature", True),
+    # any other repository: dev branches go, the rest asks
+    ("other-repo", "git push origin feature", False),
+    ("other-repo", "git push", False),
+    ("other-url", "git push origin feature", False),
+    (None, "git -C {R}/other-repo push -u origin feature", False),
+    ("other-repo", "git push origin main", True),
+    ("other-repo", "git push -f origin feature", True),
+    ("other-repo", "git push --delete origin feature", True),
+    ("other-repo", "git push origin --tags", True),
+    ("other-url", "git push origin HEAD:master", True),
+    ("feature", "git status && git log --oneline -3", False),
+]
+
+
+def selftest(rules_path=RULES_FILE):
+    global SETTINGS, DESTRUCTIVE_FLAG
+    import tempfile
+    failures, total = [], 0
+    # The rules (and their local addition with its own cases) also decide what counts as a launcher.
+    rules = load_rules(rules_path)
+    configure(rules)
+    local = rules.get("selftest", {})
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        session = "selftest-session"
+        scratch = os.path.join(d, "claude", session)
+        os.makedirs(os.path.join(scratch, "build"))
+        with open(os.path.join(scratch, "q.sql"), "w") as f:
+            f.write("SELECT 1;\n")
+        outside_dir = os.path.join(d, "outside")
+        os.makedirs(outside_dir)
+        with open(os.path.join(d, "run.sh"), "w") as f:
+            f.write("#!/bin/bash\nset -e\nnice -n 5 node /p/scripts/codex-companion.mjs task x\n")
+        with open(os.path.join(d, "ok.sh"), "w") as f:
+            f.write("#!/bin/bash\n# Run `codex app-server` only through agent-worker.\necho codex exec is not run here\n"
+                    "case $1 in claude|codex) echo $1 ;; esac\nrm -rf \"$tmp\"\nprint -r -- \"exec ${codex_bin} app-server $*\" > shim\n")
+        with open(os.path.join(d, "spawn.py"), "w") as f:
+            f.write("import subprocess\nsubprocess.run(['codex', 'exec', 'x'])\n")
+        with open(os.path.join(d, "var.sh"), "w") as f:
+            f.write("#!/bin/bash\ncomp=$HOME/p/scripts/codex-companion.mjs\nnode \"$comp\" task --json x\n")
+        with open(os.path.join(d, "wipe.sh"), "w") as f:
+            f.write(f"#!/bin/zsh\nrm -rf {outside_dir}/data\n")
+        os.makedirs(os.path.join(d, "x/agent-worker-router/scripts"))
+        with open(os.path.join(d, "x/agent-worker-router/scripts/agent-worker-router"), "w") as f:
+            f.write("#!/bin/zsh\ncompanion=$root/scripts/codex-companion.mjs\nnode \"$companion\" task --json\n")
+        with open(os.path.realpath(__file__)) as src, open(os.path.join(d, "guard-copy"), "w") as f:
+            f.write(src.read())
+        codex_cases = CODEX_CASES + [
+            ("Bash", "x/agent-worker-router/scripts/agent-worker-router --worker codex -C . x", False),
+            ("Bash", "bash var.sh", True), ("Bash", "bash run.sh", True), ("Bash", "./run.sh", True),
+            ("Bash", f"zsh {d}/run.sh", True), ("Bash", "python3 spawn.py", True), ("Bash", "bash ok.sh", False),
+            ("Bash", "./ok.sh", False),
+            # The installed guard runs itself; a copy of it anywhere else is scanned like any script.
+            ("Bash", "~/.local/bin/agent-worker-guard --selftest", False),
+            ("Bash", "/usr/bin/python3 -IS ~/.local/bin/agent-worker-guard --all < event.json", False),
+            ("Bash", f"python3 -IS {d}/guard-copy --selftest", True)] + [tuple(case) for case in local.get("codex", [])]
+        for tool, data, deny in codex_cases:
+            total += 1
+            data = data if isinstance(data, dict) else {"command": data}
+            got = decide_codex({"tool_name": tool, "tool_input": data, "cwd": d}, {})
+            if bool(got) != deny:
+                failures.append(f"codex {tool} {json.dumps(data, ensure_ascii=False)[:110]}: expected {'deny' if deny else 'allow'}")
+        total += 1
+        if decide_codex({"tool_name": "Bash", "tool_input": {"command": "codex exec x"}, "cwd": d}, {"AGENT_WORKER_GUARD": "off"}):
+            failures.append("codex env off switch")
+        for tool, data, deny in PROTECT_CASES:
+            total += 1
+            data = data if isinstance(data, dict) else {"command": data}
+            if bool(protect({"tool_name": tool, "tool_input": data})) != deny:
+                failures.append(f"protect {tool} {json.dumps(data)[:110]}: expected {'deny' if deny else 'allow'}")
+        saved = SETTINGS, DESTRUCTIVE_FLAG
+        SETTINGS = os.path.join(d, "config", "settings.json")
+        DESTRUCTIVE_FLAG = os.path.join(d, "config", "allow-destructive")
+        os.makedirs(os.path.join(d, "config"))
+        with open(SETTINGS, "w") as f:
+            json.dump(SETTINGS_FIXTURE, f, indent=2)
+        try:
+            for tool, data, deny in SETTINGS_CASES:
+                total += 1
+                data = data if isinstance(data, dict) else {"command": data}
+                payload = json.dumps(data).replace("{SET}", SETTINGS).replace("{CFG}", os.path.dirname(SETTINGS)) \
+                    .replace("{D}", d)
+                if bool(protect({"tool_name": tool, "tool_input": json.loads(payload), "cwd": d})) != deny:
+                    failures.append(f"settings {tool} {payload[:110]}: expected {'deny' if deny else 'allow'}")
+            open(DESTRUCTIVE_FLAG, "w").close()
+            total += 1
+            if protect({"tool_name": "Write", "tool_input": {"file_path": SETTINGS, "content": "{}"}, "cwd": d}) or \
+                    protect({"tool_name": "Bash", "tool_input": {"command": f"mv /tmp/s {SETTINGS}"}, "cwd": d}):
+                failures.append("allow-destructive must open the settings to edits")
+        finally:
+            SETTINGS, DESTRUCTIVE_FLAG = saved
+        # Local rules: a rule with a known id replaces it, the rest adds up; the file next to the rules is read.
+        total += 1
+        merged = {"bash": [{"id": "a", "why": "1"}], "mcp": [], "worker_deny_commands": ["x"],
+                  "global_value_options": {"git": ["-C"]}}
+        merge_rules(merged, {"bash": [{"id": "a", "why": "2"}, {"id": "b"}], "worker_deny_commands": ["x", "y"],
+                             "global_value_options": {"git": ["-c"], "cli": ["--to"]}, "messages": {"protect": "p"},
+                             "decision": "deny", "version": 9})
+        os.makedirs(os.path.join(d, "merge"))
+        with open(os.path.join(d, "merge", "destructive-rules.json"), "w") as f:
+            json.dump({"bash": [{"id": "a"}], "mcp": []}, f)
+        with open(os.path.join(d, "merge", LOCAL_RULES), "w") as f:
+            json.dump({"bash": [{"id": "c"}]}, f)
+        if [r.get("why") for r in merged["bash"]] != ["2", None] or merged["worker_deny_commands"] != ["x", "y"] or \
+                merged["global_value_options"] != {"git": ["-C", "-c"], "cli": ["--to"]} or \
+                merged["messages"] != {"protect": "p"} or merged["decision"] != "deny" or "version" in merged or \
+                [r["id"] for r in load_rules(os.path.join(d, "merge", "destructive-rules.json"))["bash"]] != ["a", "c"]:
+            failures.append("local rules merge")
+        rules["scratchpad_globs"] = [os.path.join(d, "claude", "{session_id}")]
+        test_rules = os.path.join(d, "rules.json")
+        with open(test_rules, "w") as f:
+            json.dump(rules, f)
+        cases = [(c, False) for c in SAFE + local.get("safe", [])] + \
+                [(c, True) for c in DESTRUCTIVE + local.get("destructive", [])] + [
+            (f"bash {d}/wipe.sh", True), ("bash ok.sh", False), ("zsh " + os.path.join(d, "run.sh"), False)]
+        for command, destructive in cases:
+            total += 1
+            command = command.replace("{S}", scratch).replace("{O}", outside_dir)
+            event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": d, "session_id": session,
+                     "permission_mode": "bypassPermissions"}
+            got = decide_destructive(event, {}, test_rules)
+            if bool(got) != destructive:
+                failures.append(f"destructive {command[:110]!r}: expected {'ask' if destructive else 'allow'}, got {got}")
+        total += 1
+        event = {"tool_name": "Bash", "tool_input": {"command": f"rm -rf {d}/pad/x"}, "cwd": d, "scratchpad_dir": f"{d}/pad"}
+        if decide_destructive(event, {}, test_rules):
+            failures.append("scratchpad_dir from the hook input must count as the scratchpad")
+        for tool, data, destructive in MCP_CASES + [tuple(case) for case in local.get("mcp", [])]:
+            total += 1
+            got = decide_destructive({"tool_name": tool, "tool_input": data, "cwd": d}, {}, test_rules)
+            if bool(got) != destructive:
+                failures.append(f"mcp {tool} {json.dumps(data)[:90]}: expected {'ask' if destructive else 'allow'}, got {got}")
+        repos, isolated = os.path.join(d, "repos"), ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CEILING_DIRECTORIES")
+        saved_env = {key: os.environ.get(key) for key in isolated}
+        os.environ.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_CEILING_DIRECTORIES=d)
+        try:
+            def git(*args):
+                subprocess.run(["git", *args], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+
+            os.makedirs(os.path.join(repos, "plain"))
+            git("init", "-q", "--bare", os.path.join(d, "remote.git"))
+            for name, (branch, config) in GIT_REPOS.items():
+                path = os.path.join(repos, name)
+                git("init", "-q", "-b", branch, path)
+                for key, value in [("remote.origin.url", os.path.join(d, "remote.git"))] + config:
+                    git("-C", path, "config", key, value)
+            with open(os.path.join(repos, "detached", ".git", "HEAD"), "w") as f:
+                f.write("0" * 40 + "\n")
+            git("-C", os.path.join(repos, "tagged"), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                "--allow-empty", "--no-verify", "-m", "t")
+            git("-C", os.path.join(repos, "tagged"), "tag", "v1.0")
+            for where, command, ask in GIT_PUSH_CASES + [tuple(case) for case in local.get("git_push", [])]:
+                total += 1
+                command = command.replace("{R}", repos)
+                event = {"tool_name": "Bash", "tool_input": {"command": command}, "session_id": session,
+                         "cwd": os.path.join(repos, where) if where else d}
+                got = decide_destructive(event, {}, test_rules)
+                if bool(got) != ask:
+                    failures.append(f"git push in {where or '.'} {command[:90]!r}: expected {'ask' if ask else 'allow'}, "
+                                    f"got {got}")
+        finally:
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        total += 1
+        if decide_destructive({"tool_name": "Bash", "tool_input": {"command": "git push --force"}, "cwd": d},
+                              {"AGENT_DESTRUCTIVE_GUARD": "off"}, test_rules):
+            failures.append("destructive env off switch")
+        total += 1
+        broken = decide_destructive({"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": d}, {},
+                                    os.path.join(d, "missing.json"))
+        if not broken or broken[0] != "warn":
+            failures.append("unreadable rules must warn")
+    for line in failures:
+        print("FAIL", line)
+    print(f"agent-worker-guard selftest: {total - len(failures)}/{total} OK "
+          f"({len(SAFE)} safe commands, {len(DESTRUCTIVE)} destructive, {len(MCP_CASES)} MCP calls, "
+          f"{len(SETTINGS_CASES)} settings edits, {len(GIT_PUSH_CASES)} git pushes; "
+          f"{sum(len(v) for v in local.values() if isinstance(v, list))} cases from the local rules)")
+    return 1 if failures else 0
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--selftest"]:
+        return selftest(*args[1:2])
+    try:
+        event = json.load(sys.stdin)
+        try:
+            rules = load_rules()
+            configure(rules)
+        except (OSError, ValueError):
+            rules = None  # the destructive policy says so to the user
+        reason = protect(event)
+        if reason:
+            respond("deny", reason)
+            return 0
+        if args in ([], ["--all"]):
+            reason = decide_codex(event, os.environ)
+            if reason:
+                respond("deny", reason)
+                return 0
+        if args in (["--destructive"], ["--all"]):
+            verdict = decide_destructive(event, os.environ, rules=rules)
+            if verdict:
+                respond(*verdict)
+    except Exception:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -36,6 +36,7 @@ argv() {
   for value in "${observed[@]}"; do
     if [[ $previous == --output-last-message ]]; then normalized+=(ANSWER)
     elif [[ $value == "$tmp/work" ]]; then normalized+=(DIR)
+    elif [[ $value == shell_environment_policy.include_only=* ]]; then normalized+=(INCLUDE_ONLY)
     else normalized+=("$value")
     fi
     previous=$value
@@ -50,12 +51,18 @@ wait_file() { perl -e 'for (1..500) { exit 0 if -e $ARGV[0]; select undef,undef,
 cat > "$tmp/bin/codex" <<'FAKE'
 #!/bin/zsh
 set -euo pipefail
+if [[ $1 == mcp ]]; then
+  print -l -- "$@" > "$HOME/mcp-argv"
+  cat "$HOME/mcp-list.json" 2>/dev/null || print -- "[]"
+  exit 0
+fi
 if [[ $1 == app-server ]]; then
   print -l -- "$@" > "$HOME/app-server-argv"
+  env > "$HOME/app-server-environment"
   exit 0
 fi
 if [[ $* == 'exec --help' || $* == 'exec resume --help' ]]; then
-  print -- '--sandbox --ephemeral --ignore-user-config --skip-git-repo-check --output-last-message --dangerously-bypass-approvals-and-sandbox -c'
+  print -- '--sandbox --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --output-last-message --dangerously-bypass-approvals-and-sandbox -c'
   exit 0
 fi
 print -l -- "$@" > "$HOME/argv"
@@ -129,48 +136,58 @@ grep -q 'deepseek|claude|codex' "$tmp/help" || fail help
 reject 2 --worker unknown -C "$tmp/work" test
 reject 2 --worker codex --access nonsense -C "$tmp/work" test
 reject 2 --worker claude -C "$HOME" test
+# Their contents run later outside any sandbox, so an edit worker must not get them as -C.
+mkdir -p "$HOME/.local/bin" "$HOME/.codex" "$HOME/Library/LaunchAgents"
+for private in "$HOME/.local/bin" "$HOME/.codex" "$HOME/Library/LaunchAgents"; do
+  reject 2 --worker codex -C "$private" --access edit test
+  grep -q 'includes private configuration' "$tmp/stderr" || fail "private -C: $private"
+done
 reject 2 --worker codex --access full -C "$tmp/work" test
 rc=0
 "${router:h}/deepseek" --full -C "$tmp/work" test > "$tmp/stdout" 2> "$tmp/stderr" || rc=$?
 (( rc != 0 )) || fail 'DeepSeek full access without opt-in'
 "${router:h}/setup" --full-access allow > "$tmp/setup"
 
-base=(exec --ephemeral --ignore-user-config --skip-git-repo-check --output-last-message ANSWER -C DIR)
-kept=(exec --ignore-user-config --skip-git-repo-check --output-last-message ANSWER -C DIR)
-resumed=(exec resume --ignore-user-config --skip-git-repo-check --output-last-message ANSWER)
+# What the router adds to every read or edit call; the include_only list is checked once below.
+confine=(-c features.plugins=false -c features.hooks=false -c features.apps=false -c features.multi_agent=false
+         -c 'notify=[]' -c 'web_search="disabled"' -c allow_login_shell=false
+         -c 'sandbox_workspace_write.writable_roots=[]' -c sandbox_workspace_write.exclude_slash_tmp=true -c INCLUDE_ONLY)
+base=(exec --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --output-last-message ANSWER -C DIR)
+kept=(exec --ignore-user-config --ignore-rules --skip-git-repo-check --output-last-message ANSWER -C DIR)
+resumed=(exec resume --ignore-user-config --ignore-rules --skip-git-repo-check --output-last-message ANSWER)
 run --worker codex -C "$tmp/work" test
-argv "${base[@]}" --sandbox read-only -
+argv "${base[@]}" --sandbox read-only "${confine[@]}" -
 receipt '.worker == "codex" and .model == "banner-model" and .effort == "low" and .provider == "banner-provider" and .session == "test-session" and .tokens.total == 1234 and .path == "cli" and .access == "read" and .requested == {model:null,effort:null,provider:null,access:"read"} and .kept == false and .exit == 0 and (.duration_s | type) == "number"'
 log=$(jq -r '.log' "$tmp/receipt")
 perl -e 'exit(((stat shift)[2] & 0777) == 0600 ? 0 : 1)' "$log" || fail 'private transcript'
 print -rn -- 'brief from stdin' | run --worker codex -C "$tmp/work" -
 [[ $(< "$HOME/brief") == 'brief from stdin' ]] || fail 'stdin brief'
 run --worker codex -C "$tmp/work" --effort xhigh --model M test
-argv "${base[@]}" --sandbox read-only -m M -c 'model_reasoning_effort="xhigh"' -
+argv "${base[@]}" --sandbox read-only "${confine[@]}" -m M -c 'model_reasoning_effort="xhigh"' -
 grep -q 'requested effort xhigh but the CLI reports low' "$tmp/stderr" || fail 'effort mismatch'
 grep -q 'requested model M but the CLI reports banner-model' "$tmp/stderr" || fail 'model mismatch'
 run --worker codex -C "$tmp/work" --access edit test
-argv "${base[@]}" --sandbox workspace-write -c sandbox_workspace_write.network_access=false -
+argv "${base[@]}" --sandbox workspace-write "${confine[@]}" -c sandbox_workspace_write.network_access=false -
 receipt '.access == "edit" and .requested.access == "edit"'
 run --worker codex -C "$tmp/work" --access full test
 argv "${base[@]}" --dangerously-bypass-approvals-and-sandbox -
 receipt '.access == "full"'
 grep -q 'FULL ACCESS' "$tmp/stderr" || fail 'full banner'
 run --worker codex -C "$tmp/work" --keep test
-argv "${kept[@]}" --sandbox read-only -
+argv "${kept[@]}" --sandbox read-only "${confine[@]}" -
 receipt '.kept == true'
 run --worker codex -C "$tmp/work" --resume session-1 test
-argv "${resumed[@]}" -c 'sandbox_mode="read-only"' session-1 -
+argv "${resumed[@]}" -c 'sandbox_mode="read-only"' "${confine[@]}" session-1 -
 receipt '.kept == true'
 [[ $(< "$HOME/cwd") == "$tmp/work" ]] || fail 'resume cwd'
 run --worker codex -C "$tmp/work" --resume session-1 --access edit --model M --effort high --provider openai test
-argv "${resumed[@]}" -c 'sandbox_mode="workspace-write"' -c sandbox_workspace_write.network_access=false -m M -c 'model_reasoning_effort="high"' -c 'model_provider="openai"' session-1 -
+argv "${resumed[@]}" -c 'sandbox_mode="workspace-write"' "${confine[@]}" -c sandbox_workspace_write.network_access=false -m M -c 'model_reasoning_effort="high"' -c 'model_provider="openai"' session-1 -
 receipt '.access == "edit"'
 run --worker codex -C "$tmp/work" --provider openai test
-argv "${base[@]}" --sandbox read-only -c 'model_provider="openai"' -
+argv "${base[@]}" --sandbox read-only "${confine[@]}" -c 'model_provider="openai"' -
 grep -q 'requested provider openai but the CLI reports banner-provider' "$tmp/stderr" || fail 'provider mismatch'
 
-mkdir "$HOME/.codex"
+mkdir -p "$HOME/.codex"
 cat > "$HOME/defaults.toml" <<'CONFIG'
 model = "configured-model"
 model_reasoning_effort = "high"
@@ -192,14 +209,14 @@ model = "profile-model"
 CONFIG
 ln -s "$HOME/defaults.toml" "$HOME/.codex/config.toml"
 run --worker codex -C "$tmp/work" test
-argv "${base[@]}" --sandbox read-only -m configured-model -c 'model_reasoning_effort="high"' -c 'model_provider="custom-id"' -c 'model_providers.custom-id={name="Example",base_url="https://example.invalid/v1",wire_api="responses",requires_openai_auth=false}' -
+argv "${base[@]}" --sandbox read-only "${confine[@]}" -m configured-model -c 'model_reasoning_effort="high"' -c 'model_provider="custom-id"' -c 'model_providers.custom-id={name="Example",base_url="https://example.invalid/v1",wire_api="responses",requires_openai_auth=false}' -
 receipt '.requested == {model:"configured-model",effort:"high",provider:"custom-id",access:"read"}'
 ! grep -Eq 'must-never-appear|http_headers|env_key|bearer_token|query_params' "$HOME/argv" "$tmp/receipt" || fail 'provider credential copied'
 run --worker codex -C "$tmp/work" --model M --effort none --provider openai test
-argv "${base[@]}" --sandbox read-only -m M -c 'model_reasoning_effort="none"' -c 'model_provider="openai"' -
+argv "${base[@]}" --sandbox read-only "${confine[@]}" -m M -c 'model_reasoning_effort="none"' -c 'model_provider="openai"' -
 print 'model = "-bad"\nmodel_reasoning_effort = "bogus"\nmodel_provider = "bad.id"' > "$HOME/defaults.toml"
 run --worker codex -C "$tmp/work" test
-argv "${base[@]}" --sandbox read-only -
+argv "${base[@]}" --sandbox read-only "${confine[@]}" -
 [[ $(grep -c 'ignoring invalid Codex default' "$tmp/stderr") == 3 ]] || fail 'invalid defaults warnings'
 rm "$HOME/.codex/config.toml"
 
@@ -275,7 +292,27 @@ for worker in codex claude; do
   done
   grep -q 'dropping HTTP_PROXY' "$tmp/stderr" || fail 'proxy warning'
   grep -q 'custom-home-' "$HOME/argv" || fail 'alternate config home'
+  [[ $worker == codex ]] || continue
+  grep -Eq "^TMPDIR=$tmp/agent-worker-codex\.[A-Za-z0-9]+/tmp\$" "$HOME/environment" || fail 'private worker TMPDIR'
+  grep -Eq "^ZDOTDIR=$tmp/agent-worker-codex\.[A-Za-z0-9]+/zdotdir\$" "$HOME/environment" || fail 'empty ZDOTDIR'
+  # Worker shells get exactly what the router passed, whatever the config's shell_environment_policy sets.
+  grep -Fqx -- 'shell_environment_policy.include_only=["HOME","PATH","USER","LOGNAME","SHELL","TMPDIR","LANG","TERM","HTTPS_PROXY","ALL_PROXY","NO_PROXY","https_proxy","http_proxy","all_proxy","no_proxy","CODEX_HOME","CLAUDE_CONFIG_DIR","ZDOTDIR"]' "$HOME/argv" || fail 'include_only'
 done
+[[ -z $(print -l -- "$tmp"/agent-worker-codex.*(N)) ]] || fail 'worker temporary directory left behind'
+# A local policy file hides prod CLIs from worker shells behind refusing stubs; unsafe names are skipped.
+mkdir -p "$HOME/.config/agent-worker-router"
+print -r -- '{"worker_deny_commands": ["prodctl", "bad name", "../x"]}' > "$HOME/.config/agent-worker-router/destructive-rules.json"
+run --worker codex -C "$tmp/work" test
+grep -Eq "^shell_environment_policy\.set\.PATH=\"$tmp/agent-worker-codex\.[A-Za-z0-9]+/deny:" "$HOME/argv" || fail 'worker deny PATH'
+print -r -- 'not json' > "$HOME/.config/agent-worker-router/destructive-rules.json"
+run --worker codex -C "$tmp/work" test
+grep -q 'could not read worker_deny_commands' "$tmp/stderr" && ! grep -q '^shell_environment_policy\.set\.PATH=' "$HOME/argv" || fail 'broken policy file'
+rm "$HOME/.config/agent-worker-router/destructive-rules.json"
+# The local addition next to it is read on its own too.
+print -r -- '{"worker_deny_commands": ["dbctl"]}' > "$HOME/.config/agent-worker-router/destructive-rules.local.json"
+run --worker codex -C "$tmp/work" test
+grep -Eq "^shell_environment_policy\.set\.PATH=\"$tmp/agent-worker-codex\.[A-Za-z0-9]+/deny:" "$HOME/argv" || fail 'local worker deny PATH'
+rm "$HOME/.config/agent-worker-router/destructive-rules.local.json"
 
 print '{"omit_effort":true,"omit_tokens":true}' > "$HOME/fake.json"
 run --worker codex -C "$tmp/work" test
@@ -347,6 +384,7 @@ print -r -- "{\"plugins\":{\"codex@openai-codex\":[{\"scope\":\"user\",\"install
 print '{"enabledPlugins":{"codex@openai-codex":true}}' > "$HOME/.claude/settings.json"
 cat > "$HOME/.codex/config.toml" <<'CONFIG'
 model = "configured-model"
+mcp_servers.gamma.url = "https://example.invalid/dotted"
 [mcp_servers.alpha]
 command = "alpha"
 [mcp_servers.alpha.env]
@@ -386,16 +424,20 @@ CLAUDE_CODE_FOO=secret OPENAI_API_KEY=secret run --worker codex -C "$tmp/work" -
 [[ ! -e $HOME/argv ]] || fail 'plugin call also ran the CLI'
 [[ $(< "$HOME/node-argv") == "$(print -l -- task --json --cwd "$tmp/work" --model configured-model --effort xhigh)" ]] || fail 'plugin argv'
 [[ $(< "$HOME/brief") == test ]] || fail 'plugin brief'
-app_server=(app-server --disable plugins --disable hooks --disable apps -c 'notify=[]' -c 'sandbox_mode="read-only"' -c mcp_servers.alpha.enabled=false -c mcp_servers.beta-two.enabled=false)
-[[ $(< "$HOME/app-server-argv") == "$(print -l -- "${app_server[@]}")" ]] || fail 'app-server isolation overrides'
+app_server=(app-server "${confine[@]}" -c 'sandbox_mode="read-only"' -c mcp_servers.gamma.enabled=false -c mcp_servers.alpha.enabled=false -c mcp_servers.beta-two.enabled=false)
+[[ $(sed -E 's/^shell_environment_policy\.include_only=.*/INCLUDE_ONLY/' "$HOME/app-server-argv") == "$(print -l -- "${app_server[@]}")" ]] || fail 'app-server isolation overrides'
+# Codex's own listing double-checks the scan with the same overrides before the plugin may run.
+[[ $(sed -E 's/^shell_environment_policy\.include_only=.*/INCLUDE_ONLY/' "$HOME/mcp-argv") == "$(print -l -- mcp list --json "${app_server[@]:1}")" ]] || fail 'mcp list verification argv'
+grep -Eq "^TMPDIR=$tmp/agent-worker-codex\.[A-Za-z0-9]+/tmp\$" "$HOME/app-server-environment" || fail 'app-server worker TMPDIR'
+grep -Eq "^ZDOTDIR=$tmp/agent-worker-codex\.[A-Za-z0-9]+/zdotdir\$" "$HOME/app-server-environment" || fail 'app-server ZDOTDIR'
 receipt '.path == "plugin" and .model == "rollout-model" and .effort == "low" and .provider == "rollout-provider" and .access == "read" and .session == "thread-1" and .tokens.total == 42 and .kept == true and .exit == 0 and .requested == {model:"configured-model",effort:"xhigh",provider:null,access:"read"} and (.log | endswith("-thread-1.jsonl"))'
 grep -q 'requested effort xhigh but the rollout reports low' "$tmp/stderr" || fail 'plugin effort mismatch'
-grep -q '^CODEX_COMPANION_APP_SERVER_ENDPOINT=unix:.*/no-broker.sock$' "$HOME/node-environment" || fail 'shared broker not avoided'
-grep -q "^TMPDIR=$tmp/agent-worker-plugin\." "$HOME/node-environment" || fail 'private plugin TMPDIR'
+grep -Fqx 'CODEX_COMPANION_APP_SERVER_ENDPOINT=unix:/nonexistent/agent-worker-no-broker.sock' "$HOME/node-environment" || fail 'shared broker not avoided'
+grep -Eq "^TMPDIR=$tmp/agent-worker-codex\.[A-Za-z0-9]+\$" "$HOME/node-environment" || fail 'private plugin TMPDIR'
 grep -Eq '^AGENT_WORKER_ROUTER_LEASE_HELD=[0-9]+$' "$HOME/node-environment" || fail 'plugin lease marker'
 ! grep -Eq '^(CLAUDE_CODE_FOO|OPENAI_API_KEY)=' "$HOME/node-environment" || fail 'plugin environment leaked'
 ! grep -q 'must-never-appear' "$HOME/app-server-argv" "$tmp/receipt" || fail 'MCP server secret copied'
-[[ -z $(print -l -- "$tmp"/agent-worker-plugin.*(N)) ]] || fail 'plugin temporary directory left behind'
+[[ -z $(print -l -- "$tmp"/agent-worker-codex.*(N)) ]] || fail 'plugin temporary directory left behind'
 ! grep -q 'without the isolation shim' "$tmp/stderr" || fail 'false isolation warning'
 touch "$HOME/plugin-bypass"
 run --worker codex -C "$tmp/work" test
@@ -407,10 +449,26 @@ for value in 'sandbox_mode="workspace-write"' sandbox_workspace_write.network_ac
   grep -Fqx -- "$value" "$HOME/app-server-argv" || fail "plugin override: $value"
 done
 receipt '.path == "plugin" and .access == "edit" and .requested.access == "edit"'
-mkdir -p "$tmp/repo/sub"
+print -r -- '[{"name":"alpha","enabled":false},{"name":"delta","enabled":true}]' > "$HOME/mcp-list.json"
+rm -f "$HOME/node-argv"
+run --worker codex -C "$tmp/work" test
+[[ ! -e $HOME/node-argv ]] && grep -q 'Codex plugin skipped because MCP servers would start: delta; using the CLI' "$tmp/stderr" || fail 'enabled MCP server must keep the plugin off'
+reject 1 --worker codex -C "$tmp/work" --via plugin test
+grep -q 'Codex plugin cannot run this call: MCP servers would start: delta' "$tmp/stderr" || fail '--via plugin with an enabled MCP server'
+print -r -- 'not json' > "$HOME/mcp-list.json"
+run --worker codex -C "$tmp/work" test
+grep -q 'MCP servers would start: unknown (codex mcp list failed)' "$tmp/stderr" || fail 'a failed MCP listing must keep the plugin off'
+rm "$HOME/mcp-list.json"
+mkdir -p "$tmp/repo/sub" "$tmp/project/.codex" "$HOME/.codex/rules"
 git init -q "$tmp/repo"
+print -r -- 'prefix_rule(pattern = ["true"], decision = "allow")' > "$HOME/.codex/rules/default.rules"
+run --worker codex -C "$tmp/work" test
+receipt '.path == "cli"'
+grep -q 'Codex plugin skipped because it would apply execpolicy rules' "$tmp/stderr" || fail 'execpolicy rules must keep the plugin off'
+rm -r "$HOME/.codex/rules"
 for case in "cli|--via|cli|$tmp/work|" "cli|--resume|session-1|$tmp/work|it resumes only" "cli|--access|full|$tmp/work|it has no full access" \
-            "cli|--access|read|$tmp/repo/sub|it would start in the repository root" "plugin|--access|read|$tmp/repo|"; do
+            "cli|--access|read|$tmp/repo/sub|it would start in the repository root" "plugin|--access|read|$tmp/repo|" \
+            "cli|--access|read|$tmp/project|it would load the project configuration in $tmp/project/.codex"; do
   parts=("${(@s:|:)case}")
   rm -f "$HOME/argv" "$HOME/node-argv"
   run --worker codex -C "$parts[4]" "$parts[2]" "$parts[3]" test

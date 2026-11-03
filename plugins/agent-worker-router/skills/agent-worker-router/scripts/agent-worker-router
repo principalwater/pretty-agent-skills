@@ -84,7 +84,10 @@ dir=${dir:A}
 home_real=${HOME:A}
 if [[ $access != full ]]; then
   [[ $dir != / && $dir != $home_real ]] || die '-C directory is too broad' 2
-  for private in "$HOME/.ssh" "$HOME/.aws" "$HOME/.gnupg" "$HOME/.config" "$HOME/.claude" "$HOME/Library/Keychains"; do
+  # Code planted under the last three runs later outside any sandbox: Codex config, rules and hooks,
+  # ~/.local/bin, launch agents.
+  for private in "$HOME/.ssh" "$HOME/.aws" "$HOME/.gnupg" "$HOME/.config" "$HOME/.claude" "$HOME/Library/Keychains" \
+                 "${CODEX_HOME:-$HOME/.codex}" "$HOME/.local" "$HOME/Library/LaunchAgents"; do
     private=${private:A}
     [[ $dir != $private && $dir != $private/* && $private != $dir/* ]] || die '-C directory includes private configuration' 2
   done
@@ -193,6 +196,10 @@ if [[ $worker == codex ]]; then
       elif [[ $access == full ]]; then why='it has no full access'
       # The runtime starts Codex in the Git root of --cwd, which would widen a subdirectory -C.
       elif git_root=$(env -i "HOME=$HOME" "PATH=$PATH" git -C "$dir" rev-parse --show-toplevel 2>/dev/null) && [[ ${git_root:A} != $dir ]]; then why="it would start in the repository root $git_root"
+      # The app-server has no --ignore-user-config or --ignore-rules. In a trusted -C a project layer can add
+      # MCP servers and rules, and an execpolicy allow rule runs its command outside the sandbox (seen 2026-11-03).
+      elif [[ -e $dir/.codex ]]; then why="it would load the project configuration in $dir/.codex"
+      elif [[ -n $(print -l -- "${CODEX_HOME:-$HOME/.codex}"/rules/*(N)) ]]; then why='it would apply execpolicy rules, which run matching commands outside the sandbox'
       else companion=$plugin_root/scripts/codex-companion.mjs
       fi
       [[ -z $why || $via == plugin ]] || warn "Codex plugin skipped because $why; using the CLI"
@@ -308,8 +315,44 @@ emit_receipt() {
     --arg requested_model "$model" --arg requested_effort "$effort" --arg requested_provider "$provider" --arg requested_access "$access" --arg log "$log" \
     '{worker:$worker,path:$route,model:$model,effort:$effort,provider:$provider,access:$access,session:$session,exit:$exit,duration_s:$duration,tokens:$tokens,kept:($kept == 1),requested:{model:($requested_model | if . == "" then null else . end),effort:($requested_effort | if . == "" then null else . end),provider:($requested_provider | if . == "" then null else . end),access:$requested_access},log:$log}')"
 }
-plugin_tmp=
-trap 'final_rc=$?; emit_receipt $final_rc; rm -f -- "$launch_file"; [[ -z $plugin_tmp ]] || rm -rf -- "$plugin_tmp"' EXIT
+run_tmp= confine=()
+trap 'final_rc=$?; emit_receipt $final_rc; rm -f -- "$launch_file"; [[ -z $run_tmp ]] || rm -rf -- "$run_tmp"' EXIT
+if [[ $worker == codex && $access != full ]]; then
+  # The private tmp/ is the only writable root besides -C: the caller's TMPDIR and /tmp are shared with every
+  # other process of the user. The empty zdotdir/ keeps the user's zsh dotfiles out of worker shells.
+  run_tmp=$(mktemp -d "${TMPDIR:-/tmp}/agent-worker-codex.XXXXXX")
+  mkdir "$run_tmp/tmp" "$run_tmp/zdotdir"
+  worker_env+=("ZDOTDIR=$run_tmp/zdotdir")
+  names=(${worker_env%%=*})
+  # Both routes. Measured 2026-11-03 on codex 0.163.0 with a scripted model: without these a worker ran
+  # execpolicy-allowed commands outside the sandbox, wrote to /tmp and to the caller's TMPDIR, and got dotfile
+  # exports and `shell_environment_policy.set`; on the plugin route it also wrote to user `writable_roots` and
+  # got MCP servers. A worker never starts workers, so sub-agents are off as well.
+  confine=(-c features.plugins=false -c features.hooks=false -c features.apps=false -c features.multi_agent=false
+           -c 'notify=[]' -c 'web_search="disabled"' -c allow_login_shell=false
+           -c 'sandbox_workspace_write.writable_roots=[]' -c sandbox_workspace_write.exclude_slash_tmp=true
+           -c "shell_environment_policy.include_only=[${(j:,:)${(@qqq)names}}]")
+  [[ $access != edit ]] || confine+=(-c sandbox_workspace_write.network_access=false)
+  # Production CLIs listed by the policy file and its local addition (destructive-rules.local.json next to it) meet
+  # a refusing stub first on the PATH of worker shells (not of Codex itself). The sandbox already cuts their
+  # network; the stub refuses before they even start.
+  policy=${AGENT_WORKER_ROUTER_POLICY:-$HOME/.config/agent-worker-router/destructive-rules.json}
+  policies=()
+  for file in $policy ${policy:h}/destructive-rules.local.json; do
+    [[ -f $file ]] && policies+=($file)
+  done
+  if (( $#policies )); then
+    denied=$(jq -rs '[.[].worker_deny_commands[]? | strings | select(test("^[A-Za-z0-9._-]+$"))] | unique | .[]' $policies) || { warn "could not read worker_deny_commands from ${(j:, :)policies}"; denied=; }
+    if [[ -n $denied ]]; then
+      mkdir "$run_tmp/deny"
+      for name in ${(f)denied}; do
+        print -rl -- '#!/bin/sh' "echo 'agent-worker-router: $name is not available to workers: production systems need the user' >&2" 'exit 126' > "$run_tmp/deny/$name"
+      done
+      chmod 700 "$run_tmp"/deny/*
+      confine+=(-c "shell_environment_policy.set.PATH=$(jq -nc --arg p "$run_tmp/deny:$PATH" '$p')")
+    fi
+  fi
+fi
 cd "$dir"
 rc=0
 if [[ $worker == claude ]]; then
@@ -398,48 +441,56 @@ else
     fi
   fi
   if [[ -n $companion ]]; then
-    plugin_tmp=$(mktemp -d "${TMPDIR:-/tmp}/agent-worker-plugin.XXXXXX")
     sandbox=read-only
     [[ $access != edit ]] || sandbox=workspace-write
-    # The runtime starts `codex app-server` with the whole user config. Switching off MCP servers, plugins,
-    # hooks, apps and notify keeps the worker as light as `codex exec --ignore-user-config`; on 2026-11-03
-    # `codex mcp list` went from 24 servers in 5.3 s to 21 disabled in 0.02 s with these overrides.
-    overrides=(--disable plugins --disable hooks --disable apps -c 'notify=[]' -c "sandbox_mode=\"$sandbox\"")
-    [[ $access != edit ]] || overrides+=(-c sandbox_workspace_write.network_access=false)
+    # The runtime starts `codex app-server` with the whole user config; `confine` switches off what the CLI
+    # route never loads. On 2026-11-03 `codex mcp list` went from 24 servers in 5.3 s to 21 disabled in 0.02 s.
+    overrides=("${confine[@]}" -c "sandbox_mode=\"$sandbox\"")
     [[ -z $provider ]] || overrides+=(-c "model_provider=\"$provider\"")
     if [[ -f $config ]]; then
-      # shortcut: only [mcp_servers.NAME] tables are found; inline or dotted definitions stay enabled.
-      for name in ${(f)"$(perl -ne 'print "$1$2\n" if /^\s*\[mcp_servers\.(?:"([A-Za-z0-9_-]+)"|([A-Za-z0-9_-]+))\]\s*(?:#.*)?$/' "$config")"}; do
+      # Server tables, dotted keys and inline values that start a line; Codex's listing below catches the rest.
+      for name in ${(fu)"$(perl -ne 'print "$1$2\n" if /^\s*\[?\s*mcp_servers\.(?:"([A-Za-z0-9_-]+)"|([A-Za-z0-9_-]+))[\s.\]=]/' "$config")"}; do
         overrides+=(-c "mcp_servers.$name.enabled=false")
       done
     fi
-    mkdir "$plugin_tmp/bin"
+    enabled=$(env -i "${worker_env[@]}" "$codex_bin" mcp list --json "${overrides[@]}" < /dev/null 2>/dev/null |
+              jq -er '[.[] | select(.enabled) | .name] | join(" ")') || enabled='unknown (codex mcp list failed)'
+    if [[ -n $enabled ]]; then
+      [[ $via != plugin ]] || die "Codex plugin cannot run this call: MCP servers would start: $enabled"
+      warn "Codex plugin skipped because MCP servers would start: $enabled; using the CLI"
+      companion=
+    fi
+  fi
+  if [[ -n $companion ]]; then
+    mkdir "$run_tmp/bin"
     print -rl -- '#!/bin/zsh' \
-      "[[ \$* != app-server ]] || : > ${(q)plugin_tmp}/isolated" \
-      "[[ \$1 != app-server ]] || exec ${(q)codex_bin} app-server ${(j: :)${(@q)overrides}} \"\${@:2}\"" \
-      "exec ${(q)codex_bin} \"\$@\"" > "$plugin_tmp/bin/codex"
-    chmod 700 "$plugin_tmp/bin/codex"
+      "[[ \$* != app-server ]] || : > ${(q)run_tmp}/isolated" \
+      "[[ \$1 != app-server ]] || TMPDIR=${(q)run_tmp}/tmp exec ${(q)codex_bin} app-server ${(j: :)${(@q)overrides}} \"\${@:2}\"" \
+      "exec ${(q)codex_bin} \"\$@\"" > "$run_tmp/bin/codex"
+    chmod 700 "$run_tmp/bin/codex"
     args=(task --json --cwd "$dir")
     [[ $access != edit ]] || args+=(--write)
     [[ -z $model ]] || args+=(--model "$model")
     [[ -z $effort ]] || args+=(--effort "$effort")
     # A missing broker socket makes the runtime start its own app-server instead of a detached shared broker,
-    # which would outlive both the lease and the timeout. The private TMPDIR keeps its job state per call.
-    print -rn -- "$brief" | run_worker "$timeout" env -i "${worker_env[@]}" "PATH=$plugin_tmp/bin:$PATH" "TMPDIR=$plugin_tmp" \
-        "CODEX_COMPANION_APP_SERVER_ENDPOINT=unix:$plugin_tmp/no-broker.sock" "$node_bin" "$companion" "${args[@]}" > "$out" || rc=$?
+    # which would outlive both the lease and the timeout. The runtime retries direct only on ENOENT: a socket
+    # path over 104 bytes gives EINVAL, a missing directory under / always ENOENT. Its job state stays in
+    # run_tmp, out of reach of the worker, whose writable TMPDIR the shim sets to run_tmp/tmp.
+    print -rn -- "$brief" | run_worker "$timeout" env -i "${worker_env[@]}" "PATH=$run_tmp/bin:$PATH" "TMPDIR=$run_tmp" \
+        CODEX_COMPANION_APP_SERVER_ENDPOINT=unix:/nonexistent/agent-worker-no-broker.sock "$node_bin" "$companion" "${args[@]}" > "$out" || rc=$?
     if [[ ! -s $launch_file ]]; then
       (( rc != 76 )) || die "lease wait timed out: $lease" 76
       die 'worker supervisor failed' 1
     fi
     # The job record names the thread as soon as it exists, even when the runtime fails later.
     thread=$(jq -r '.threadId // empty' "$out" 2>/dev/null) || thread=
-    [[ -n $thread ]] || thread=$(cat -- "$plugin_tmp"/codex-companion/*/jobs/*.json(N) /dev/null | jq -r '.threadId // empty' 2>/dev/null) || thread=
+    [[ -n $thread ]] || thread=$(cat -- "$run_tmp"/codex-companion/*/jobs/*.json(N) /dev/null | jq -r '.threadId // empty' 2>/dev/null) || thread=
     [[ $thread =~ '^[A-Za-z0-9-]+$' ]] || thread=
     # Falling back after a thread exists could repeat its edits, so only a failure before any thread retries on the CLI.
     if (( rc == 0 || rc == 142 )) || [[ -n $thread || $via == plugin ]]; then
       route=plugin ran=1
       # A runtime that stops resolving `codex` through PATH would bypass the shim and load the full user config.
-      [[ -z $thread || -e $plugin_tmp/isolated ]] || warn 'Codex plugin started app-server without the isolation shim: MCP servers, plugins and hooks of the user config may have run'
+      [[ -z $thread || -e $run_tmp/isolated ]] || warn 'Codex plugin started app-server without the isolation shim: MCP servers, plugins and hooks of the user config may have run'
       (( rc != 142 )) || die "timed out after ${timeout}s; partial output: $out" 124
       (( rc == 0 )) && jq -er '.rawOutput | strings | select(length > 0)' "$out" 2>/dev/null || die "Codex exited without a response (exit $rc): $out" 1
       exit 0
@@ -449,12 +500,12 @@ else
     rc=0
   fi
   cli_help=$(env -i "${worker_env[@]}" "$codex_bin" exec --help) || die 'could not inspect Codex CLI'
-  for flag in --sandbox --ephemeral --ignore-user-config --output-last-message; do
+  for flag in --sandbox --ephemeral --ignore-user-config --ignore-rules --output-last-message; do
     [[ $cli_help == *$flag* ]] || die "Codex CLI does not support $flag"
   done
   if [[ -n $resume ]]; then
     cli_help=$(env -i "${worker_env[@]}" "$codex_bin" exec resume --help) || die 'could not inspect Codex resume CLI'
-    for flag in --ignore-user-config --output-last-message -c; do
+    for flag in --ignore-user-config --ignore-rules --output-last-message -c; do
       [[ $cli_help == *$flag* ]] || die "Codex resume CLI does not support $flag"
     done
   fi
@@ -466,7 +517,8 @@ else
   elif (( ! keep )); then
     args+=(--ephemeral)
   fi
-  args+=(--ignore-user-config --skip-git-repo-check --output-last-message "$answer")
+  # --ignore-user-config keeps $CODEX_HOME/rules: an allow rule there runs its command outside the sandbox.
+  args+=(--ignore-user-config --ignore-rules --skip-git-repo-check --output-last-message "$answer")
   [[ -n $resume ]] || args+=(-C "$dir")
   case $access in
     read|edit)
@@ -477,7 +529,7 @@ else
       else
         args+=(--sandbox "$sandbox")
       fi
-      [[ $access != edit ]] || args+=(-c sandbox_workspace_write.network_access=false) ;;
+      args+=("${confine[@]}") ;;
     full) args+=(--dangerously-bypass-approvals-and-sandbox) ;;
   esac
   [[ -z $model ]] || args+=(-m "$model")
@@ -487,7 +539,7 @@ else
     [[ -z $provider_table ]] || args+=(-c "model_providers.$provider=$provider_table")
   fi
   [[ -z $resume ]] || args+=("$resume")
-  print -rn -- "$brief" | run_worker "$timeout" env -i "${worker_env[@]}" \
+  print -rn -- "$brief" | run_worker "$timeout" env -i "${worker_env[@]}" ${run_tmp:+"TMPDIR=$run_tmp/tmp"} \
       "$codex_bin" "${args[@]}" - > "$out" 2>&1 || rc=$?
   if [[ ! -s $launch_file ]]; then
     (( rc != 76 )) || die "lease wait timed out: $lease" 76

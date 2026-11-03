@@ -34,7 +34,17 @@ requires_openai_auth = false
 CONFIG
 "${clean_env[@]}" "${0:A:h}/agent-worker-router" --worker codex -C "$t/work" --timeout 8 test > "$t/answer" 2> "$t/diagnostics" || true
 sed -n 's/^agent-worker-router: receipt //p' "$t/diagnostics" > "$t/receipt"
-jq -se 'length == 1 and (.[0] | .model == "banner-contract-model" and .effort == "high" and .provider == "selftest")' "$t/receipt" >/dev/null || fail 'Codex banner contract'
+jq -se 'length == 1 and (.[0] | .model == "banner-contract-model" and .effort == "high" and .provider == "selftest" and .path == "cli")' "$t/receipt" >/dev/null || fail 'Codex banner contract'
+# The plugin route stays light only while these app-server overrides really switch MCP servers off.
+"${clean_env[@]}" "$codex_bin" app-server --disable plugins --disable hooks --disable apps -c 'notify=[]' --help > /dev/null || fail 'Codex app-server overrides'
+print -l '[mcp_servers.selftest]' 'command = "true"' >> "$t/home/.codex/config.toml"
+"${clean_env[@]}" "$codex_bin" -c mcp_servers.selftest.enabled=false mcp list --json > "$t/mcp.json" || fail 'Codex mcp list'
+jq -e 'map(select(.name == "selftest")) | length == 1 and all(.enabled == false)' "$t/mcp.json" >/dev/null || fail 'Codex MCP disable override'
+plugin_root=$(jq -r '.plugins["codex@openai-codex"][0].installPath // empty' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json" 2>/dev/null) || plugin_root=
+if [[ -n $plugin_root && -f $plugin_root/scripts/codex-companion.mjs ]]; then
+  help=$("${clean_env[@]}" node "$plugin_root/scripts/codex-companion.mjs" help) || fail 'Codex plugin help'
+  [[ $help == *'task '*--write*--model*--effort* ]] || fail 'Codex plugin task contract'
+fi
 print 'selftest offline contracts OK'
 
 if ! "${0:A:h}/setup" --check; then

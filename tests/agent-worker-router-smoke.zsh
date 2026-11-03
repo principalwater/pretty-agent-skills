@@ -50,6 +50,10 @@ wait_file() { perl -e 'for (1..500) { exit 0 if -e $ARGV[0]; select undef,undef,
 cat > "$tmp/bin/codex" <<'FAKE'
 #!/bin/zsh
 set -euo pipefail
+if [[ $1 == app-server ]]; then
+  print -l -- "$@" > "$HOME/app-server-argv"
+  exit 0
+fi
 if [[ $* == 'exec --help' || $* == 'exec resume --help' ]]; then
   print -- '--sandbox --ephemeral --ignore-user-config --skip-git-repo-check --output-last-message --dangerously-bypass-approvals-and-sandbox -c'
   exit 0
@@ -62,8 +66,16 @@ if [[ -f $HOME/check-lease ]]; then
   perl -e 'my @want=stat shift; for (glob "/dev/fd/*") { my @s=stat $_; die "lease fd leaked\n" if @s && $s[0]==$want[0] && $s[1]==$want[1] }' "$(< "$HOME/check-lease")"
 fi
 data=$(< "$HOME/fake.json")
+sandbox=read-only
+for (( i = 1; i <= $#; i++ )); do
+  case ${argv[i]} in
+    --sandbox) sandbox=${argv[i+1]} ;;
+    sandbox_mode=*) sandbox=${${argv[i]#sandbox_mode=\"}%\"} ;;
+    --dangerously-bypass-approvals-and-sandbox) sandbox=danger-full-access ;;
+  esac
+done
 print -u2 -l -- 'Reading additional input from stdin...' 'OpenAI Codex v0.163.0' '--------' "workdir: $PWD"
-print -u2 -l -- "model: $(print -r -- "$data" | jq -r '.model // "banner-model"')" "provider: $(print -r -- "$data" | jq -r '.provider // "banner-provider"')" 'approval: never' 'sandbox: read-only'
+print -u2 -l -- "model: $(print -r -- "$data" | jq -r '.model // "banner-model"')" "provider: $(print -r -- "$data" | jq -r '.provider // "banner-provider"')" 'approval: never' "sandbox: $sandbox [workdir]"
 if [[ $(print -r -- "$data" | jq -r '.omit_effort // false') != true ]]; then
   print -u2 -- "reasoning effort: $(print -r -- "$data" | jq -r '.effort // "low"')"
 fi
@@ -128,7 +140,7 @@ kept=(exec --ignore-user-config --skip-git-repo-check --output-last-message ANSW
 resumed=(exec resume --ignore-user-config --skip-git-repo-check --output-last-message ANSWER)
 run --worker codex -C "$tmp/work" test
 argv "${base[@]}" --sandbox read-only -
-receipt '.worker == "codex" and .model == "banner-model" and .effort == "low" and .provider == "banner-provider" and .session == "test-session" and .tokens.total == 1234 and .requested == {model:null,effort:null,provider:null} and .kept == false and .exit == 0 and (.duration_s | type) == "number"'
+receipt '.worker == "codex" and .model == "banner-model" and .effort == "low" and .provider == "banner-provider" and .session == "test-session" and .tokens.total == 1234 and .path == "cli" and .access == "read" and .requested == {model:null,effort:null,provider:null,access:"read"} and .kept == false and .exit == 0 and (.duration_s | type) == "number"'
 log=$(jq -r '.log' "$tmp/receipt")
 perl -e 'exit(((stat shift)[2] & 0777) == 0600 ? 0 : 1)' "$log" || fail 'private transcript'
 print -rn -- 'brief from stdin' | run --worker codex -C "$tmp/work" -
@@ -139,8 +151,10 @@ grep -q 'requested effort xhigh but the CLI reports low' "$tmp/stderr" || fail '
 grep -q 'requested model M but the CLI reports banner-model' "$tmp/stderr" || fail 'model mismatch'
 run --worker codex -C "$tmp/work" --access edit test
 argv "${base[@]}" --sandbox workspace-write -c sandbox_workspace_write.network_access=false -
+receipt '.access == "edit" and .requested.access == "edit"'
 run --worker codex -C "$tmp/work" --access full test
 argv "${base[@]}" --dangerously-bypass-approvals-and-sandbox -
+receipt '.access == "full"'
 grep -q 'FULL ACCESS' "$tmp/stderr" || fail 'full banner'
 run --worker codex -C "$tmp/work" --keep test
 argv "${kept[@]}" --sandbox read-only -
@@ -151,6 +165,7 @@ receipt '.kept == true'
 [[ $(< "$HOME/cwd") == "$tmp/work" ]] || fail 'resume cwd'
 run --worker codex -C "$tmp/work" --resume session-1 --access edit --model M --effort high --provider openai test
 argv "${resumed[@]}" -c 'sandbox_mode="workspace-write"' -c sandbox_workspace_write.network_access=false -m M -c 'model_reasoning_effort="high"' -c 'model_provider="openai"' session-1 -
+receipt '.access == "edit"'
 run --worker codex -C "$tmp/work" --provider openai test
 argv "${base[@]}" --sandbox read-only -c 'model_provider="openai"' -
 grep -q 'requested provider openai but the CLI reports banner-provider' "$tmp/stderr" || fail 'provider mismatch'
@@ -178,7 +193,7 @@ CONFIG
 ln -s "$HOME/defaults.toml" "$HOME/.codex/config.toml"
 run --worker codex -C "$tmp/work" test
 argv "${base[@]}" --sandbox read-only -m configured-model -c 'model_reasoning_effort="high"' -c 'model_provider="custom-id"' -c 'model_providers.custom-id={name="Example",base_url="https://example.invalid/v1",wire_api="responses",requires_openai_auth=false}' -
-receipt '.requested == {model:"configured-model",effort:"high",provider:"custom-id"}'
+receipt '.requested == {model:"configured-model",effort:"high",provider:"custom-id",access:"read"}'
 ! grep -Eq 'must-never-appear|http_headers|env_key|bearer_token|query_params' "$HOME/argv" "$tmp/receipt" || fail 'provider credential copied'
 run --worker codex -C "$tmp/work" --model M --effort none --provider openai test
 argv "${base[@]}" --sandbox read-only -m M -c 'model_reasoning_effort="none"' -c 'model_provider="openai"' -
@@ -196,7 +211,7 @@ claude_base=(-p --safe-mode --strict-mcp-config --no-session-persistence --disab
 claude_kept=(-p --safe-mode --strict-mcp-config --disable-slash-commands --output-format json --permission-prompts none --disallowedTools "${denied[@]}")
 run --worker claude -C "$tmp/work" test
 argv "${claude_base[@]}" --restricted --permission-mode dontAsk --tools Read,Grep,Glob
-receipt '.worker == "claude" and .model == "claude-test" and .effort == "unverified" and .provider == "unverified" and .session == "claude-session" and .tokens == {input:11,output:7} and .requested == {model:null,effort:null,provider:null}'
+receipt '.worker == "claude" and .model == "claude-test" and .effort == "unverified" and .provider == "unverified" and .session == "claude-session" and .tokens == {input:11,output:7} and .path == "cli" and .access == "unverified" and .requested == {model:null,effort:null,provider:null,access:"read"}'
 # Agent hosts hand their tools a socket as stdin, which makes `script` fail unless the router redirects it.
 rc=0
 perl -e 'use Socket; socketpair(my $a, my $b, AF_UNIX, SOCK_STREAM, PF_UNSPEC) or die "socketpair: $!"; open STDIN, "<&", $a or die "dup: $!"; exec @ARGV or die "exec: $!"' \
@@ -210,7 +225,7 @@ mkdir "$HOME/.claude"
 print '{"model":"opus[1m]","effortLevel":"xhigh"}' > "$HOME/.claude/settings.json"
 run --worker claude -C "$tmp/work" test
 argv "${claude_base[@]}" --restricted --permission-mode dontAsk --tools Read,Grep,Glob --model 'opus[1m]' --effort xhigh
-receipt '.requested == {model:"opus[1m]",effort:"xhigh",provider:null}'
+receipt '.requested == {model:"opus[1m]",effort:"xhigh",provider:null,access:"read"}'
 run --worker claude -C "$tmp/work" --model M --effort low test
 argv "${claude_base[@]}" --restricted --permission-mode dontAsk --tools Read,Grep,Glob --model M --effort low
 rm "$HOME/.claude/settings.json"
@@ -323,6 +338,116 @@ reject 75 --worker claude -C "$tmp/work" test
 grep -q 'Claude usage limit until' "$tmp/stderr" || fail 'limit cache'
 AGENT_WORKER_ROUTER_LEASE_HELD=outer reject 77 --worker claude -C "$tmp/work" test
 rm "$HOME/.config/agent-worker-router/claude-limit-until"
+
+# A fake `node` stands in for the Codex plugin runtime and starts `codex app-server` through the router's shim.
+plugin=$tmp/plugin
+mkdir -p "$plugin/scripts" "$HOME/.claude/plugins" "$HOME/.codex"
+touch "$plugin/scripts/codex-companion.mjs"
+print -r -- "{\"plugins\":{\"codex@openai-codex\":[{\"scope\":\"user\",\"installPath\":\"$plugin\"}]}}" > "$HOME/.claude/plugins/installed_plugins.json"
+print '{"enabledPlugins":{"codex@openai-codex":true}}' > "$HOME/.claude/settings.json"
+cat > "$HOME/.codex/config.toml" <<'CONFIG'
+model = "configured-model"
+[mcp_servers.alpha]
+command = "alpha"
+[mcp_servers.alpha.env]
+TOKEN = "must-never-appear"
+[mcp_servers."beta-two"]
+url = "https://example.invalid/mcp"
+CONFIG
+cat > "$tmp/bin/node" <<'FAKE'
+#!/bin/zsh
+set -euo pipefail
+shift
+if [[ $1 == help ]]; then
+  print -- '  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]'
+  exit 0
+fi
+print -l -- "$@" > "$HOME/node-argv"
+env > "$HOME/node-environment"
+cat > "$HOME/brief"
+[[ -f $HOME/plugin-bypass ]] || codex app-server
+[[ ! -f $HOME/plugin-prestart ]] || { print -u2 -- 'Codex CLI is not installed'; exit 1; }
+mkdir -p "$TMPDIR/codex-companion/work-0/jobs" "$HOME/.codex/sessions/2026/11/03"
+print -r -- '{"id":"task-1","threadId":"thread-1"}' > "$TMPDIR/codex-companion/work-0/jobs/task-1.json"
+sandbox=read-only
+(( ! ${argv[(Ie)--write]} )) || sandbox=workspace-write
+print -rl -- '{"type":"session_meta","payload":{"id":"thread-1","model_provider":"rollout-provider"}}' \
+  '{"type":"event_msg","payload":{"type":"token_count","info":null}}' \
+  "{\"type\":\"turn_context\",\"payload\":{\"model\":\"rollout-model\",\"effort\":\"low\",\"sandbox_policy\":{\"type\":\"$sandbox\"}}}" \
+  '{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":42}}}}' \
+  '{"type":"turn_context","payload":{"model":"half-wri' > "$HOME/.codex/sessions/2026/11/03/rollout-2026-11-03T00-00-00-thread-1.jsonl"
+[[ ! -f $HOME/plugin-midturn ]] || { print -u2 -- 'turn failed'; exit 1; }
+[[ ! -f $HOME/timeout ]] || exec perl -e 'sleep 10'
+print -r -- '{"status":0,"threadId":"thread-1","rawOutput":"OK","touchedFiles":[]}'
+FAKE
+chmod +x "$tmp/bin/node"
+rm -f "$HOME/argv"
+CLAUDE_CODE_FOO=secret OPENAI_API_KEY=secret run --worker codex -C "$tmp/work" --effort xhigh --lease "$tmp/plugin.lock" test
+[[ ! -e $HOME/argv ]] || fail 'plugin call also ran the CLI'
+[[ $(< "$HOME/node-argv") == "$(print -l -- task --json --cwd "$tmp/work" --model configured-model --effort xhigh)" ]] || fail 'plugin argv'
+[[ $(< "$HOME/brief") == test ]] || fail 'plugin brief'
+app_server=(app-server --disable plugins --disable hooks --disable apps -c 'notify=[]' -c 'sandbox_mode="read-only"' -c mcp_servers.alpha.enabled=false -c mcp_servers.beta-two.enabled=false)
+[[ $(< "$HOME/app-server-argv") == "$(print -l -- "${app_server[@]}")" ]] || fail 'app-server isolation overrides'
+receipt '.path == "plugin" and .model == "rollout-model" and .effort == "low" and .provider == "rollout-provider" and .access == "read" and .session == "thread-1" and .tokens.total == 42 and .kept == true and .exit == 0 and .requested == {model:"configured-model",effort:"xhigh",provider:null,access:"read"} and (.log | endswith("-thread-1.jsonl"))'
+grep -q 'requested effort xhigh but the rollout reports low' "$tmp/stderr" || fail 'plugin effort mismatch'
+grep -q '^CODEX_COMPANION_APP_SERVER_ENDPOINT=unix:.*/no-broker.sock$' "$HOME/node-environment" || fail 'shared broker not avoided'
+grep -q "^TMPDIR=$tmp/agent-worker-plugin\." "$HOME/node-environment" || fail 'private plugin TMPDIR'
+grep -Eq '^AGENT_WORKER_ROUTER_LEASE_HELD=[0-9]+$' "$HOME/node-environment" || fail 'plugin lease marker'
+! grep -Eq '^(CLAUDE_CODE_FOO|OPENAI_API_KEY)=' "$HOME/node-environment" || fail 'plugin environment leaked'
+! grep -q 'must-never-appear' "$HOME/app-server-argv" "$tmp/receipt" || fail 'MCP server secret copied'
+[[ -z $(print -l -- "$tmp"/agent-worker-plugin.*(N)) ]] || fail 'plugin temporary directory left behind'
+! grep -q 'without the isolation shim' "$tmp/stderr" || fail 'false isolation warning'
+touch "$HOME/plugin-bypass"
+run --worker codex -C "$tmp/work" test
+grep -q 'Codex plugin started app-server without the isolation shim' "$tmp/stderr" || fail 'bypassed shim not reported'
+rm "$HOME/plugin-bypass"
+run --worker codex -C "$tmp/work" --access edit --provider openai test
+[[ $(< "$HOME/node-argv") == "$(print -l -- task --json --cwd "$tmp/work" --write --model configured-model)" ]] || fail 'plugin edit argv'
+for value in 'sandbox_mode="workspace-write"' sandbox_workspace_write.network_access=false 'model_provider="openai"'; do
+  grep -Fqx -- "$value" "$HOME/app-server-argv" || fail "plugin override: $value"
+done
+receipt '.path == "plugin" and .access == "edit" and .requested.access == "edit"'
+mkdir -p "$tmp/repo/sub"
+git init -q "$tmp/repo"
+for case in "cli|--via|cli|$tmp/work|" "cli|--resume|session-1|$tmp/work|it resumes only" "cli|--access|full|$tmp/work|it has no full access" \
+            "cli|--access|read|$tmp/repo/sub|it would start in the repository root" "plugin|--access|read|$tmp/repo|"; do
+  parts=("${(@s:|:)case}")
+  rm -f "$HOME/argv" "$HOME/node-argv"
+  run --worker codex -C "$parts[4]" "$parts[2]" "$parts[3]" test
+  receipt ".path == \"$parts[1]\""
+  if [[ $parts[1] == cli ]]; then [[ -e $HOME/argv && ! -e $HOME/node-argv ]] || fail "expected the CLI: $case"; fi
+  [[ -z $parts[5] ]] || grep -q "Codex plugin skipped because $parts[5]" "$tmp/stderr" || fail "skip reason: $case"
+done
+print '{"enabledPlugins":{"codex@openai-codex":false}}' > "$HOME/.claude/settings.json"
+rm -f "$HOME/node-argv"
+run --worker codex -C "$tmp/work" test
+[[ ! -e $HOME/node-argv ]] && ! grep -q 'Codex plugin' "$tmp/stderr" || fail 'a disabled plugin must be skipped silently'
+reject 1 --worker codex -C "$tmp/work" --via plugin test
+grep -q 'Codex plugin cannot run this call: it is not enabled' "$tmp/stderr" || fail '--via plugin refusal'
+reject 2 --worker claude -C "$tmp/work" --via cli test
+reject 2 --worker codex -C "$tmp/work" --via native test
+print '{"enabledPlugins":{"codex@openai-codex":true}}' > "$HOME/.claude/settings.json"
+touch "$HOME/plugin-prestart"
+rm -f "$HOME/argv"
+run --worker codex -C "$tmp/work" test
+[[ -e $HOME/argv ]] && grep -q 'Codex plugin failed before starting a thread (exit 1); using the CLI' "$tmp/stderr" || fail 'pre-start fallback'
+receipt '.path == "cli" and .exit == 0'
+rc=0; "$router" --worker codex -C "$tmp/work" --via plugin test > "$tmp/stdout" 2> "$tmp/stderr" || rc=$?
+(( rc == 1 )) || fail '--via plugin must not fall back'
+receipt '.path == "plugin" and .exit == 1 and .session == "unverified"'
+rm "$HOME/plugin-prestart"
+touch "$HOME/plugin-midturn"
+rm -f "$HOME/argv"
+rc=0; "$router" --worker codex -C "$tmp/work" test > "$tmp/stdout" 2> "$tmp/stderr" || rc=$?
+(( rc == 1 )) && [[ ! -e $HOME/argv ]] || fail 'a started thread must not be retried on the CLI'
+receipt '.path == "plugin" and .exit == 1 and .session == "thread-1" and .model == "rollout-model"'
+rm "$HOME/plugin-midturn"
+touch "$HOME/timeout"
+rc=0; "$router" --worker codex -C "$tmp/work" --timeout 1 test > "$tmp/stdout" 2> "$tmp/stderr" || rc=$?
+(( rc == 124 )) || fail 'plugin timeout status'
+receipt '.path == "plugin" and .exit == 124'
+rm "$HOME/timeout"
+rm -rf "$HOME/.claude/plugins" "$HOME/.claude/settings.json" "$HOME/.codex/config.toml" "$HOME/.codex/sessions"
 
 lease=$tmp/shared.lock
 print 'preserve this content' > "$lease"

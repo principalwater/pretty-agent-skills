@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 6,
   "about": [
     "Destructive actions an agent session may run only after the user's own approval, never in checks. Read by",
     "`agent-worker-guard --destructive` on every tool call, so a new rule works at once. Install this file as",
@@ -23,7 +23,19 @@
     "  global_value_options, or comes as --option=value).",
     "Safety net: when the parser does not see a command that the raw text runs (outside quotes, comments and",
     "  heredocs) and that a bash rule watches, the guard asks as for rule unparsed-command.",
-    "mcp: tool = regex on the tool name; optional when {field, nonempty | equals | not_in, default} and sql_field.",
+    "mcp: tool = regex on the tool name; optional when {field, nonempty | equals | not_in | matches, default} and",
+    "  sql_field. matches is a regex searched in each string of the field, or of the whole input when no field is",
+    "  given; the fragments that the regex in ignore matches are cut out first. A condition the guard cannot",
+    "  evaluate (a broken regex, a wrong type) does not switch the rule off: it matches.",
+    "browser-js-write: page JavaScript runs with the user's signed-in session. These ask: a quoted POST, PUT, PATCH",
+    "  or DELETE unless it is compared with something (m === 'DELETE'), a client call such as .post( or",
+    "  axios.delete(, a form submit and an obvious write statement of SQL anywhere in the text. Cut out as a read: a",
+    "  fetch whose URL is a plain literal root-relative path (no host, query string or ${} substitution) that ends in",
+    "  /api/ds/query (Grafana) or in /api/v1/query or query_range (Prometheus), with method POST as its first option.",
+    "  The exception goes by the path alone: the guard does not know which site the page is on or where a base",
+    "  element points. For browser_batch every string of the input is read, typed text and action summaries included.",
+    "  A method built at run time and a click are not seen: the rule catches a mistake, not an attempt to get around",
+    "  it.",
     "worker_deny_commands: agent-worker-router puts refusing stubs for these first on every Codex worker's PATH.",
     "launchers, launcher_options_end: wrappers that run the next command; the latter take options up to `--`.",
     "messages: replacements for the guard's texts (codex_why, codex_use, codex_launch, codex_agent, protect, rule,",
@@ -98,7 +110,8 @@
     {"id": "jira-write", "tool": "^mcp__(?:[a-z0-9-]+_)?jira__(create_issue|update_issue|add_comment|transition_issue|link_issues|delete_issue_link|delete_issue_attachment|upload_issue_attachments)$", "why": "writes to Jira"},
     {"id": "gitlab-write", "tool": "^mcp__(?:[a-z0-9-]+_)?gitlab__(add_merge_request_note|create_discussion|create_merge_request|update_merge_request|reply_to_discussion|resolve_discussion|run_job)$", "why": "writes to GitLab"},
     {"id": "confluence-write", "tool": "^mcp__(?:[a-z0-9-]+_)?confluence__(?:confluence_)?(create_page|update_page|update_page_section|move_page|reply_to_footer_comment|reply_to_inline_comment)$", "why": "writes to Confluence"},
-    {"id": "session-delete", "tool": "^mcp__ccd_session_mgmt__delete_session$|^mcp__ccd_host__(discard_kept_worktree|clean_up_worktrees)$|^mcp__scheduled-tasks__delete_scheduled_task$", "why": "deletes a session, worktree or scheduled task"}
+    {"id": "session-delete", "tool": "^mcp__ccd_session_mgmt__delete_session$|^mcp__ccd_host__(discard_kept_worktree|clean_up_worktrees)$|^mcp__scheduled-tasks__delete_scheduled_task$", "why": "deletes a session, worktree or scheduled task"},
+    {"id": "browser-js-write", "tool": "^mcp__.*__(?:javascript_tool|browser_batch)$", "when": {"matches": "['\"`](?:POST|PUT|PATCH|DELETE)['\"`]|(?i:\\bmethod['\"]?\\]?\\s*[:=]\\s*['\"`]\\s*(?:post|put|patch|delete)\\s*['\"`])|(?i:\\.open\\s*\\(\\s*['\"`]\\s*(?:post|put|patch|delete)\\s*['\"`])|\\.(?:post|put|patch)\\s*\\(|\\.(?:delete|del)\\s*\\(\\s*['\"`]\\s*(?:/|https?:)|\\b(?:axios|ky|superagent|\\$?http|api|(?:http|api|rest)Client|\\w*[Bb]ackendSrv)\\b(?:\\(\\s*\\))?\\.(?:delete|del)\\s*\\(|\\bsendBeacon\\s*\\(|\\.(?:submit|requestSubmit)\\s*\\(|(?i:\\b(?:create(?:\\s+or\\s+replace)?(?:\\s+temporary)?|drop|truncate|alter|rename|detach|attach|optimize|exchange)\\s+(?:tables?|database|view|materialized\\s+view|dictionar(?:y|ies)|partition)\\b|\\bdelete\\s+from\\b|\\binsert\\s+into\\b|\\bupdate\\s+\\S+\\s+set\\s+\\S+\\s*=)", "ignore": "\\bfetch\\s*\\(\\s*(['\"`])(?=/(?!/))(?:(?!\\$\\{)[^'\"`?#\\\\])*/api/(?:ds/query|v1/query(?:_range)?)\\1\\s*,\\s*\\{\\s*['\"]?method['\"]?\\s*:\\s*['\"`]POST['\"`]|[=!]=\\s*['\"`](?:POST|PUT|PATCH|DELETE)['\"`]|['\"`](?:POST|PUT|PATCH|DELETE)['\"`]\\s*[=!]="}, "why": "page JavaScript sends a write request, submits a form or carries a write statement of SQL, with the signed-in user's session"}
   ],
   "worker_deny_commands": ["clickhouse", "clickhouse-client", "yt", "airflow", "kubectl", "psql", "security", "launchctl", "osascript", "gh", "glab"]
 }

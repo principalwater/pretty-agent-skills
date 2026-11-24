@@ -1538,23 +1538,55 @@ def field(data, path, default=None):
     return data
 
 
+def strings(value):
+    """Every string inside a JSON value, however deep: a condition reads a nested or batched input as its texts."""
+    found, queue = [], [value]
+    while queue:
+        item = queue.pop()
+        if isinstance(item, str):
+            found.append(item)
+        elif isinstance(item, (dict, list)):
+            queue.extend(item.values() if isinstance(item, dict) else item)
+    return found
+
+
+def when_holds(when, data):
+    """Whether a rule's condition holds for this input. Raises on a condition that cannot be evaluated."""
+    # Without a field the condition reads the whole input.
+    value = field(data, when["field"], when.get("default")) if "field" in when else data
+    if "nonempty" in when and bool(value) != when["nonempty"]:
+        return False
+    if "equals" in when and value != when["equals"]:
+        return False
+    # Anything but a list here is no exception at all: the rule keeps matching.
+    if isinstance(when.get("not_in"), list) and value in when["not_in"]:
+        return False
+    if isinstance(when.get("matches"), str):
+        # Both are compiled before any value is read, so that a broken regex shows on every call. Each string is
+        # judged on its own: nothing spans two values. ignore cuts known harmless fragments out first: the same
+        # words anywhere else still count, and a match that is empty cuts nothing.
+        wanted = re.compile(when["matches"])
+        cut = re.compile(when["ignore"]) if isinstance(when.get("ignore"), str) else None
+        texts = strings(value)
+        if cut:
+            texts = [cut.sub(lambda found: " " if found.group() else "", s) for s in texts]
+        return any(wanted.search(s) for s in texts)
+    return True
+
+
 def mcp_rule(rule, tool, data, rules):
     if not re.search(rule["tool"], tool):
         return False
-    when = rule.get("when")
-    if when:
-        value = field(data, when["field"], when.get("default"))
-        if "nonempty" in when and bool(value) != when["nonempty"]:
+    try:
+        when = rule.get("when")
+        if when and not when_holds(when, data):
             return False
-        if "equals" in when and value != when["equals"]:
-            return False
-        # Anything but a list here is no exception at all: the rule keeps matching.
-        if isinstance(when.get("not_in"), list) and value in when["not_in"]:
-            return False
-    if "sql_field" in rule:
-        sql = field(data, rule["sql_field"])
-        if isinstance(sql, str) and not sql_writes(sql, rules):
-            return False
+        if "sql_field" in rule:
+            sql = field(data, rule["sql_field"])
+            if isinstance(sql, str) and not sql_writes(sql, rules):
+                return False
+    except (AttributeError, KeyError, TypeError, ValueError, re.error, OverflowError, RecursionError):
+        pass  # a condition that cannot be evaluated is no exception either: the rule keeps matching
     return True
 
 
@@ -2076,6 +2108,86 @@ MCP_CASES = [
     ("mcp__confluence__get_page", {'page_id': '1'}, False),
     ("mcp__ccd_session_mgmt__delete_session", {'session_id': 'x'}, True),
 ]
+# Page JavaScript in a browser tool, as (text, asks): a write request asks, a read goes through.
+BROWSER_JS = [
+    ("(await (await fetch('/api/dashboards/uid/x')).json()).dashboard.title", False),
+    ("await fetch('/api/dashboards/uid/x', {method: 'DELETE'})", True),
+    ('await fetch(url, {"method": "post", body: b})', True),
+    ("const m = 'PATCH'; await fetch(u, {method: m})", True),
+    ("const verb = 'PUT'; await send(verb)", True),
+    ("const o = {}; o['method'] = 'delete'; await fetch(u, o)", True),
+    ("const x = new XMLHttpRequest(); x.open('put', u); x.send(b)", True),
+    ("await api.delete(`/api/items/${id}`)", True),
+    ("await store.delete('https://example.com/api/items/1')", True),
+    ("await axios.delete(url)", True),
+    ("await getBackendSrv().delete(url)", True),
+    ("await apiClient.delete(url)", True),
+    ("await request.del('/api/items/1')", True),
+    ("await superagent.del(url)", True),
+    ("seen.delete(id); [...seen].length", False),
+    ("const cacheClient = new Map(); cacheClient.delete(id); cacheClient.size", False),
+    ("await axios.post(u, b)", True),
+    ("await http.put(u, b)", True),
+    ("await http.patch(u, b)", True),
+    ("navigator.sendBeacon('/api/log', d)", True),
+    ("document.querySelector('form').submit()", True),
+    ("document.querySelector('form').requestSubmit()", True),
+    ("document.querySelector('button').click()", False),
+    ("rows.filter(r => r.method === 'GET').length", False),
+    ("rows.filter(r => r.method === 'DELETE' || r.method !== \"POST\").length", False),
+    ("rows.filter(r => r.method ===  'PUT' ||\n    'PATCH' == r.method).length", False),
+    ('const sql = "CREATE TABLE t (id INTEGER)"; await run(sql)', True),
+    # A query sent with POST is a read: Grafana's /api/ds/query, the Prometheus query API.
+    ("await fetch('/api/ds/query', {method: 'POST', credentials: 'include', headers: {'Content-Type': "
+     "'application/json'}, body: JSON.stringify({queries: [{refId: 'A', expr: 'up'}]})})", False),
+    ("await fetch('/api/v1/query', {method: 'POST', body: p})", False),
+    ("await fetch(\"/api/datasources/proxy/uid/x/api/v1/query_range\", {\"method\": \"POST\", body: p})", False),
+    ("await fetch('/api/ds/query', {method: 'POST', body: JSON.stringify({queries: [{rawSql: 'SELECT 1 FROM t'}]})})",
+     False),
+    ("await fetch('/grafana$prod/api/ds/query', {method: 'POST', body: q})", False),
+    # ... unless the text carries a write statement or a second request, method is not the first option, or the URL
+    # is not a plain literal on the page's own site: another site, a query string, a template with a substitution.
+    ("await fetch('/api/ds/query', {method: 'POST', body: JSON.stringify({queries: [{rawSql: 'DROP TABLE t'}]})})",
+     True),
+    ("await fetch('/api/ds/query', {method: 'POST', body: JSON.stringify({queries: [{rawSql: 'delete from t'}]})})",
+     True),
+    ("await fetch('/api/ds/query', {method: 'POST', body: JSON.stringify({queries: [{rawSql: 'INSERT INTO t SELECT "
+     "1'}]})})", True),
+    ("await fetch('/api/ds/query', {method: 'POST', body: JSON.stringify({queries: [{rawSql: 'UPDATE t SET a = 1'}]})})",
+     True),
+    ("await fetch('/api/ds/query', {method: 'POST', body: q}); await fetch('/api/dashboards/db', {method: 'POST'})",
+     True),
+    ("await fetch('/api/ds/query', {body: q}); await fetch('/api/x', {method: 'POST'})", True),
+    ("await fetch('/api/ds/query', {headers: {'X-HTTP-Method-Override': 'DELETE'}, method: 'POST'})", True),
+    ("await fetch('/api/ds/query', {credentials: 'include', method: 'POST'})", True),
+    ("await fetch('/api/ds/query', {method: 'DELETE'})", True),
+    ("await fetch('/api/user/auth-tokens/rotate', {method: 'POST'})", True),
+    ("await fetch('/api/admin/users?next=/api/ds/query', {method: 'POST'})", True),
+    ("await fetch('/api/ds/query?x=1', {method: 'POST'})", True),
+    ("await fetch('/api/ds/query/x', {method: 'POST'})", True),
+    ("await fetch('https://example.com/api/ds/query', {method: 'POST', body: d})", True),
+    ("await fetch('//example.com/api/ds/query', {method: 'POST', body: d})", True),
+    ("await fetch(`${base}/api/v1/query_range`, {method: 'POST', body: p})", True),
+    ("await fetch(`/x/${navigator.sendBeacon(u, d)}/api/ds/query`, {method: 'POST'})", True),
+    ("const u = '/api/ds/query'; await fetch(u, {method: 'POST', body: q})", True),
+] + [(f"await fetch('/api/ds/query', {{method: 'POST', body: JSON.stringify({{q: '{sql}'}})}})", True) for sql in (
+    "create or replace view v as select 1", "CREATE TEMPORARY TABLE t (a Int8)", "truncate table t",
+    "ALTER TABLE t MODIFY COLUMN a Int8", "RENAME TABLE a TO b", "DETACH PARTITION 1", "ATTACH TABLE t",
+    "OPTIMIZE TABLE t FINAL", "EXCHANGE TABLES a AND b", "DROP DATABASE d", "DROP MATERIALIZED VIEW v",
+    "DROP DICTIONARY d", "EXCHANGE DICTIONARIES a AND b")]
+MCP_CASES += [("mcp__Claude_Browser__javascript_tool", {"action": "javascript_exec", "text": text}, asks)
+              for text, asks in BROWSER_JS] + [
+    ("mcp__claude-in-chrome__javascript_tool", {"action": "javascript_exec", "text": "fetch(u, {method: 'PUT'})"}, True),
+    ("mcp__Claude_Browser__browser_batch", {"actions": [
+        {"name": "navigate", "input": {"url": "https://example.com/d/x"}},
+        {"name": "javascript_tool", "input": {"action": "javascript_exec", "text": "fetch(u, {method: 'DELETE'})"}}]},
+     True),
+    ("mcp__Claude_Browser__browser_batch", {"actions": [
+        {"name": "navigate", "input": {"url": "https://example.com/d/x"}},
+        {"name": "javascript_tool", "input": {"action": "javascript_exec", "text": "document.title"}}]}, False),
+    ("mcp__Claude_Browser__get_page_text", {}, False),
+    ("mcp__Claude_Browser__navigate", {"url": "https://example.com/?q='DELETE'"}, False),
+]
 
 # git push. Repositories the self-test makes in {R}: name -> (current branch, config); origin is a local bare repo.
 GIT_REPOS = {
@@ -2374,6 +2486,21 @@ def selftest(rules_path=RULES_FILE):
             got = decide_destructive({"tool_name": tool, "tool_input": data, "cwd": d}, {}, rules_file)
             if bool(got) != destructive:
                 failures.append(f"mcp {tool} {json.dumps(data)[:90]}: expected {'ask' if destructive else 'allow'}, got {got}")
+        # when.matches reads each string of the field once ignore has cut its fragments out; a condition that
+        # cannot be evaluated keeps the rule matching.
+        total += 1
+        probe, deep = {"field": "a.b", "matches": "x", "ignore": "<x>"}, "y"
+        for _ in range(5000):
+            deep = [deep]
+        if [mcp_rule({"tool": "^t$", "when": when}, "t", {"a": {"b": value}}, {}) for value, when in (
+                (["<x>", {"c": "x"}], probe), ("<x> y", probe), (["x<", ">"], dict(probe, matches="<>")), (deep, probe),
+                ("xx", dict(probe, matches="xx", ignore="")), ("y", dict(probe, matches="(")),
+                ("y", dict(probe, ignore="(")), ("y", dict(probe, matches="x{4294967296}")),
+                ("y", dict(probe, matches=None)), ("y", dict(probe, field=42)), ("y", 42),
+                (42, dict(probe, matches="(")), (42, dict(probe, ignore="(")))] \
+                != [True, False, False, False, True, True, True, True, True, True, True, True, True] or \
+                not mcp_rule({"tool": "^t$", "sql_field": 42}, "t", {"a": 1}, {}):
+            failures.append("when.matches: each string of the field, ignore cut out first; a broken condition matches")
         repos, isolated = os.path.join(d, "repos"), ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CEILING_DIRECTORIES")
         saved_env = {key: os.environ.get(key) for key in isolated}
         os.environ.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_CEILING_DIRECTORIES=d)

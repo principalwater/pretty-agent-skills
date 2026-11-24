@@ -6,6 +6,13 @@ Two policies, one hook entry each:
   agent-worker-guard --destructive  destructive commands and MCP calls wait for the user's approval
   agent-worker-guard --all          both, for a single hook entry
   agent-worker-guard --selftest [RULES]  decision tables of both policies, the local rules' own cases included
+  ... --harness claude|codex        the harness that calls the hook; without it Codex is told by its turn_id
+
+Harnesses. The hook speaks the PreToolUse command-hook protocol of Claude Code, which Codex adopted: the same event
+on stdin, the same hookSpecificOutput on stdout. What differs is kept in one table (HARNESSES) and one function
+(normalize): Codex cannot honor "ask" from a hook (it runs the call), so there a match is a refusal that names whose
+decision it is; it edits files with apply_patch; its hooks live in hooks.json. Codex has no PreToolUse event for
+write_stdin and lets a call through when a hook crashes or times out: there the guard is a net, not a wall.
 
 Codex policy. A direct launch (codex exec/review/app-server, codex-companion.mjs task/review, the
 codex:codex-rescue agent) runs with the user's whole Codex config: every MCP server, its sandbox and approval
@@ -15,7 +22,11 @@ Destructive policy. Destructive actions only with the user's own approval, never
 ~/.config/agent-worker-router/destructive-rules.json (the repository ships destructive-rules.default.json for it),
 read on every call together with destructive-rules.local.json from the same directory: the machine's own tools,
 accounts and MCP servers, kept out of the repository. A match returns the rules' decision: "ask", or "deny" in the
-permission modes they list.
+permission modes they list. Three settings narrow it: sql_ask "destructive" asks only about SQL that removes or
+overwrites (an INSERT INTO or a CREATE goes through), unknown_sql_decision "deny" refuses a query the guard cannot
+read before the shell runs it and tells the agent to save the SQL to a file first, and tool_scripts names the
+scripts that are themselves commands the rules watch, so that `source ~/bin/tool` is not scanned for what the tool
+might run.
 
 Off switches, for the user only (the guard refuses agents that touch them): AGENT_WORKER_GUARD=off and
 AGENT_DESTRUCTIVE_GUARD=off in the environment of Claude Code; the files allow-direct-codex (until removed) and
@@ -40,10 +51,16 @@ DESTRUCTIVE_FLAG = os.path.join(CONFIG, "allow-destructive")
 RULES_FILE = os.path.join(CONFIG, "destructive-rules.json")
 LOCAL_RULES = "destructive-rules.local.json"
 SETTINGS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "settings.json")
+# Codex keeps its hooks in a file of their own, with the same "hooks" table as the Claude settings.
+CODEX_HOOKS = os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "hooks.json")
+SETTINGS_NAME = r"(?:settings(?:\.local)?|hooks)\.json"
+# What a harness can do with a hook's answer. Codex 0.163 takes "ask" for an invalid answer and runs the call, so
+# there a match must be a refusal. A harness not listed here gets the careful reading: no "ask".
+HARNESSES = {"claude": {"ask": True}, "codex": {"ask": False}}
 GUARD_ENV = ("AGENT_WORKER_GUARD", "AGENT_DESTRUCTIVE_GUARD")
 FLAG_TTL = 15 * 60
 # The guard's words; the rules' "messages" table may replace any of them (codex_why, codex_use, codex_launch,
-# codex_agent, protect, rule).
+# codex_agent, protect, rule, unknown_sql).
 MESSAGES = {
     "codex_why": "A direct launch runs with the whole Codex config: every MCP server, its sandbox and approval "
                  "settings, a shared broker.",
@@ -54,6 +71,10 @@ MESSAGES = {
     "protect": "Only the user changes the guard's switches and rules.",
     "rule": "{message} Rule {id}: {why}. Command: {what}",
     "fallback": "the guard could not read the command {heads}, which it has to check",
+    "unknown_sql": "The guard cannot read this query before the shell runs it: the text comes from a variable, a "
+                   "substitution or a file this same command writes. Save the SQL to a file in a separate call, then "
+                   "run it from that file by its absolute path: the guard reads the file itself. Rule {id}. "
+                   "Command: {what}",
 }
 DEFAULT_MESSAGES = dict(MESSAGES)
 # codex subcommands that run a model or an agent runtime, or apply its changes to the tree.
@@ -101,8 +122,10 @@ HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 SUBST = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
 CODE_CALL = re.compile(r"codex-companion\.mjs|app-server-broker\.mjs|"
                        r"[\"']codex[\"']\s*,\s*\[?\s*[\"'](?:exec|e|review|resume|fork|app-server|exec-server)[\"']")
-SQL_STRING = re.compile(r"'(?:[^'\\]|\\.|'')*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`|@@.*?@@", re.S)
-SQL_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.S)
+# Comments and string literals in one pass, whichever starts first: an apostrophe in a comment opens no string, `--`
+# in a string starts no comment. Group 1 is a comment; ClickHouse's `# ...` and `#!...` count at the start of a word.
+SQL_LEX = re.compile(r"(--[^\n]*|/\*.*?\*/|(?:\A|(?<=\s))#[ !][^\n]*)|"
+                     r"'(?:[^'\\]|\\.|'')*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`|@@.*?@@", re.S)
 # Writes that can hide inside a statement that starts with a read keyword (YQL DEFINE ACTION ... AS INSERT ...).
 SQL_WRITE = re.compile(
     r"\b(insert (into|overwrite) (?!@)|upsert into|replace into|delete from|update \S+ set|"
@@ -111,6 +134,24 @@ SQL_WRITE = re.compile(
     r"materialized|live|window|named|row|object|topic|external|async|if|cluster)\b|optimize table|"
     r"kill (query|mutation)|system (drop|reload|stop|start|flush|restart|sync|kill|shutdown|freeze|unfreeze|restore))",
     re.I)
+# The same without what only adds (INSERT INTO, CREATE): what the rules' sql_ask "destructive" still asks about.
+SQL_DESTRUCTIVE = re.compile(
+    r"\b(insert overwrite (?!@)|upsert into|replace into|delete from|update \S+ set|create or replace |"
+    r"\w*truncate_on_insert\s*=\s*(?:1|true)|"
+    r"(?<!show )(?<!exists )(drop|alter|truncate|rename|attach|detach|exchange|undrop) "
+    r"(temporary |or replace )?(table|view|database|dictionary|function|user|role|quota|policy|profile|settings|index|"
+    r"materialized|live|window|named|row|object|topic|external|async|if|cluster)\b|optimize table|"
+    r"kill (query|mutation)|system (drop|reload|stop|start|flush|restart|sync|kill|shutdown|freeze|unfreeze|restore))",
+    re.I)
+# Statements that only add, and the words that make one of them overwrite (YQL `INSERT INTO t WITH TRUNCATE`, the
+# ClickHouse settings s3_truncate_on_insert and the like).
+SQL_ADDS = re.compile(r"insert into\b|create (temporary )?(table|view|materialized view|live view|window view|database|"
+                      r"dictionary|function)\b", re.I)
+SQL_OVERWRITES = re.compile(r"\b(overwrite|or replace(?!\s*\()|truncate(?!\s*\()|"
+                            r"\w*truncate_on_insert\s*=\s*(?:1|true))\b", re.I)
+YT_ENGINES = {"ql", "yql", "chyt", "spyt"}
+# What bash_rule returns for a query it cannot read before the shell runs it.
+UNKNOWN_SQL = "unknown-sql"
 
 
 def base(word):
@@ -119,7 +160,8 @@ def base(word):
 
 def strip_comments(text):
     """The text without its shell comments: as in the shell, `#` starts one only at the start of a word and outside
-    quotes, so `${#x}`, `${p#pre}` and `https://x/#top` stay words."""
+    quotes, so `${#x}`, `${p#pre}` and `https://x/#top` stay words. The descriptor number of a redirection goes too:
+    in `rm -rf x 2>/dev/null` the 2 is not a path."""
     out, quote, k = [], None, 0
     while k < len(text):
         ch = text[k]
@@ -139,6 +181,13 @@ def strip_comments(text):
             end = text.find("\n", k)
             k = len(text) if end < 0 else end
             continue
+        elif ch.isdigit() and (k == 0 or text[k - 1] in " \t\r\n;&|()"):
+            end = k
+            while end < len(text) and text[end].isdigit():
+                end += 1
+            if end < len(text) and text[end] in "<>":
+                k = end
+                continue
         out.append(ch)
         k += 1
     return "".join(out)
@@ -189,21 +238,116 @@ def blank_quotes(text):
     return "".join(out)
 
 
+class Quoted(str):
+    """A word that only spells an operator: it was quoted or escaped (`tr ';' ' '`, `find . -exec rm {} \\;`)."""
+
+
+def mark_quoted_operators(text, marks):
+    """The text with each quoted or escaped run of operator characters replaced by a key of marks. shlex drops the
+    quotes, and `rm -rf ';' /data` must not read as two commands."""
+    out, k = [], 0
+    while k < len(text):
+        ch, key = text[k], f"\0{len(marks)}\0"
+        if ch == "\\" and k + 1 < len(text):
+            if text[k + 1] in PUNCT - {"\n"}:
+                marks[key] = text[k + 1]
+                out.append(key)
+            else:
+                out.append(text[k:k + 2])
+            k += 2
+        elif ch in "'\"":
+            end = skip_span(text, k + 1, ch)
+            body = text[k + 1:end - 1]
+            if body and set(body) <= PUNCT and text[end - 1:end] == ch:
+                marks[key] = body
+                out.append(key)
+            else:
+                out.append(text[k:end])
+            k = end
+        else:
+            out.append(ch)
+            k += 1
+    return "".join(out)
+
+
 def tokens(text):
-    lex = shlex.shlex(strip_comments(text), posix=True, punctuation_chars=";&|()<>\n")
+    marks = {}
+    lex = shlex.shlex(mark_quoted_operators(strip_comments(text), marks), posix=True, punctuation_chars=";&|()<>\n")
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
     lex.commenters = ""
-    return list(lex)
+    # A word made of quoted operators only (`';'`, `';'';'`) stays a word; inside a longer word the quotes just go.
+    return [Quoted("".join(marks[key] for key in re.findall(r"\0\d+\0", tok))) if re.fullmatch(r"(?:\0\d+\0)+", tok)
+            else re.sub(r"\0\d+\0", lambda m: marks.get(m.group(0), ""), tok) if "\0" in tok else tok for tok in lex]
+
+
+def unquoted(line, stack):
+    """Indexes of a line where the shell reads operators: outside quotes and comments, inside `$(...)` even when
+    that sits in double quotes. stack holds the spans still open and carries over to the next line."""
+    outside, k = set(), 0
+    while k < len(line):
+        ch, top = line[k], stack[-1] if stack else None
+        if top == "'":
+            if ch == "'":
+                stack.pop()
+        elif ch == "\\":
+            k += 1
+        elif top == '"':
+            if ch == '"':
+                stack.pop()
+            elif line.startswith("$(", k):
+                stack.append("(")
+                k += 1
+            elif ch == "`":
+                stack.append("`")
+        elif ch in "'\"":
+            stack.append(ch)
+        elif ch == "`":
+            stack.pop() if top == "`" else stack.append("`")
+        elif ch == "(":
+            stack.append("(")
+        elif ch == ")":
+            if top == "(":
+                stack.pop()
+        elif ch == "#" and (k == 0 or line[k - 1] in " \t;&|()<>"):
+            break
+        else:
+            outside.add(k)
+        k += 1
+    return outside
+
+
+def code_indexes(text):
+    """Indexes of a shell text where the shell reads commands: outside quotes, comments and heredoc bodies."""
+    found, offset, stack, lines, i = set(), 0, [], text.split("\n"), 0
+    while i < len(lines):
+        line = lines[i]
+        free = unquoted(line, stack)
+        found.update(offset + k for k in free)
+        offset += len(line) + 1
+        i += 1
+        for match in HEREDOC.finditer(line):
+            if match.start() in free:
+                # The body and the line that ends it are text for the command, not commands.
+                while i < len(lines):
+                    offset += len(lines[i]) + 1
+                    i += 1
+                    if lines[i - 1].strip() == match.group(2):
+                        break
+    return found
 
 
 def fold_heredocs(text):
-    """The text with each heredoc body moved into HEREDOCS and replaced by its key."""
-    lines, kept, i = text.split("\n"), [], 0
+    """The text with each heredoc body moved into HEREDOCS and replaced by its key. A `<<WORD` in quotes or in a
+    comment is text: it starts no heredoc and must not swallow the lines after it."""
+    lines, kept, i, stack = text.split("\n"), [], 0, []
     while i < len(lines):
         line, out, last = lines[i], [], 0
         i += 1
+        outside = unquoted(line, stack)
         for match in HEREDOC.finditer(line):
+            if match.start() not in outside:
+                continue
             body = []
             while i < len(lines) and lines[i].strip() != match.group(2):
                 body.append(lines[i])
@@ -242,7 +386,7 @@ def parse(text):
             while k < len(toks) and not closed:
                 part = toks[k]
                 k += 1
-                if part and set(part) <= PUNCT:
+                if part and set(part) <= PUNCT and not isinstance(part, Quoted):
                     for n, ch in enumerate(part):
                         depth += (ch == "(") - (ch == ")")
                         if depth == 0:
@@ -259,7 +403,7 @@ def parse(text):
             commands.extend(parse(text))
             cur["words"].append(f"{tok}({text})")
             continue
-        if tok and set(tok) <= PUNCT:
+        if tok and set(tok) <= PUNCT and not isinstance(tok, Quoted):
             if "<" in tok or ">" in tok:
                 target = toks[k] if k < len(toks) else ""
                 k += 1
@@ -316,9 +460,17 @@ def read_script(path, cwd):
 
 def read_text(path, ctx, cwd):
     """A file's text, preferring what an earlier command of the same text wrote there (heredoc, echo, printf)."""
+    # A relative path under a working directory the guard lost track of names no file it can read.
+    if ctx is not None and ctx.get("cwd") in (None, TEMP) and not os.path.isabs(os.path.expanduser(path)):
+        return None
     full = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
     if ctx is not None and full in ctx.get("files", {}):
         return ctx["files"][full]
+    # Unknown too: a file under a directory an earlier command was given to write, or one that inline code of an
+    # earlier interpreter call names. What is on disk now may be the copy a previous run left.
+    if ctx is not None and (any(text is None and full.startswith(known + os.sep) for known, text in ctx.get("files", {}).items())
+                            or any(base(full) in code for code in ctx.get("codes", []))):
+        return None
     return read_script(path, cwd)
 
 
@@ -582,20 +734,22 @@ def settings_named(word, cwd):
     """Kinds ("user", "project") of the Claude settings files a shell word holds a path to, as an argument or inside
     code."""
     return {settings_kind(os.path.join(cwd, m.group(0)))
-            for m in re.finditer(r"[^\s'\"=:;,()<>|&`]*settings(?:\.local)?\.json(?![\w.-])", home_path(word))} - {None}
+            for m in re.finditer(r"[^\s'\"=:;,()<>|&`]*" + SETTINGS_NAME + r"(?![\w.-])", home_path(word))} - {None}
 
 
 def into_settings_dir(words, cwd):
-    """`cp /tmp/settings.json ~/.claude/`: a settings.json copied or moved into the user settings directory."""
-    folder = os.path.dirname(os.path.realpath(SETTINGS))
-    return any(base(w) == "settings.json" for w in words) and \
-        any(os.path.realpath(os.path.join(cwd, home_path(w))) == folder for w in words)
+    """`cp /tmp/settings.json ~/.claude/`: a settings.json copied or moved into the user settings directory (or a
+    hooks.json into Codex's)."""
+    return any(any(base(w) == base(path) for w in words) and
+               any(os.path.realpath(os.path.join(cwd, home_path(w))) == os.path.dirname(os.path.realpath(path))
+                   for w in words) for path in (SETTINGS, CODEX_HOOKS))
 
 
 def settings_kind(path):
-    """"user" for the user settings file, "project" for another Claude settings file, else None."""
+    """"user" for a file that registers the guard (the Claude user settings, Codex's hooks.json), "project" for
+    another Claude settings file, else None."""
     full = os.path.realpath(path)
-    if full == os.path.realpath(SETTINGS):
+    if full in (os.path.realpath(SETTINGS), os.path.realpath(CODEX_HOOKS)):
         return "user"
     if base(full) in ("settings.json", "settings.local.json") and base(os.path.dirname(full)) == ".claude":
         return "project"
@@ -660,10 +814,18 @@ def protect(event):
             if switches(before, kind == "user") != switches(after, kind == "user"):
                 return text("protect")
         return None
+    if tool == "apply_patch":
+        # Codex edits files with a patch envelope (`*** Update File: path`, `*** Move to: path`). What a patch does
+        # to a file that registers the guard is not worked out: such a patch is the user's to make.
+        patch = str(data.get("command") or data.get("input") or data.get("patch") or "")
+        for path in re.findall(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): *(.+?) *$", patch, re.M):
+            if base(path) in files or not opened and settings_kind(os.path.join(cwd, os.path.expanduser(path))) == "user":
+                return text("protect")
+        return None
     if tool in ("Bash", "mcp__terminal__run_in_terminal"):
         command = str(data.get("command") or "")
         switch_words = [] if opened else [*GUARD_ENV, "disableAllHooks"]
-        settings = not opened and re.search(r"settings(?:\.local)?\.json", command) is not None
+        settings = not opened and re.search(SETTINGS_NAME, command) is not None
         if not settings and not any(name in command for name in files + switch_words):
             return None
         switched = any(word in command for word in switch_words)
@@ -820,22 +982,51 @@ def outside(path, ctx, script):
 
 
 def sql_writes(sql, rules):
-    text = re.sub(r"\s+", " ", SQL_COMMENT.sub(" ", SQL_STRING.sub("''", sql)))
+    """True when a query text holds a statement to ask about: any write, or with the rules' sql_ask "destructive"
+    only one that removes or overwrites."""
+    text = re.sub(r"\s+", " ", SQL_LEX.sub(lambda m: " " if m.group(1) else "''", sql))
     reads = set(rules.get("sql_read_statements", []))
     safe = {s.upper() for s in rules.get("sql_safe_statements", [])}
+    lenient = rules.get("sql_ask") == "destructive"
+    temporary = set()
     for statement in text.split(";"):
         statement = statement.strip()
         # YQL `INSERT INTO @name` fills an anonymous table that lives only inside the query.
         if not statement or statement.upper() in safe or re.match(r"insert (into|overwrite) @", statement, re.I):
+            continue
+        # A ClickHouse temporary table lives only in the session: making, filling and dropping it changes nothing.
+        # Only a plain, unqualified name counts (a quoted one is blanked above and would stand for any table; `db . t`
+        # is a table of a database), and only a drop that says TEMPORARY: a plain DROP TABLE of that name would reach
+        # a real table if the CREATE had failed.
+        made = re.match(r"create temporary table (?:if not exists )?([A-Za-z_]\w*)(?!\w)(?!\s*\.)", statement, re.I)
+        filled = re.match(r"insert into ([A-Za-z_]\w*)(?!\w)(?!\s*\.)", statement, re.I)
+        dropped = re.fullmatch(r"drop temporary table (?:if exists )?([A-Za-z_]\w*)(?: sync| no delay)?",
+                               statement, re.I)
+        engines = re.findall(r"\bengine\s*=?\s*([A-Za-z_]\w*)", statement, re.I)
+        # Names are case-sensitive in ClickHouse; a temporary table on another engine may write outside the session.
+        if made and all(engine.lower() == "memory" for engine in engines):
+            temporary.add(made.group(1))
+            continue
+        if filled and filled.group(1) in temporary:
+            continue
+        if dropped and dropped.group(1) in temporary:
+            temporary.discard(dropped.group(1))
             continue
         match = re.match(r"[(\s]*([A-Za-z$][A-Za-z0-9_$]*)", statement)
         word = match.group(1).upper() if match else ""
         # These only describe a statement: `EXPLAIN AST CREATE ...`, `SHOW CREATE TABLE ...`.
         if word in ("EXPLAIN", "SHOW", "DESCRIBE", "DESC", "EXISTS"):
             continue
-        if word and not word.startswith("$") and word not in reads:
-            return True
-        if SQL_WRITE.search(statement):
+        if lenient:
+            # Adding is not destroying: an INSERT INTO or a CREATE goes through unless it also overwrites.
+            overwrites = SQL_OVERWRITES.search(statement)
+            if SQL_ADDS.match(statement) and not overwrites:
+                continue
+            hidden = SQL_DESTRUCTIVE.search(statement) or \
+                overwrites and re.search(r"\binsert into (?!@)", statement, re.I)
+        else:
+            hidden = SQL_WRITE.search(statement)
+        if word and not word.startswith("$") and word not in reads or hidden:
             return True
     return False
 
@@ -855,18 +1046,30 @@ def sql_texts(rule, cmd, c, head, pos, ctx):
             found.append(sql_word(words[k + 1], ctx))
         elif word.startswith("--query="):
             found.append(sql_word(word.split("=", 1)[1], ctx))
-        elif word == "--queries-file" and k + 1 < len(words):
-            files = expand(words[k + 1], ctx)
+        elif word == "--queries-file" and k + 1 < len(words) or word.startswith("--queries-file="):
+            files = expand(word.split("=", 1)[1] if "=" in word else words[k + 1], ctx)
             found.append([read_text(f, ctx, cwd) for f in files] if files else None)
-    if head == "yt" and pos[:1] in (["start-query"], ["query"]):
-        found += [sql_word(p, ctx) for p in pos[2:3]]
+    if head == "yt" and pos[:1] in (["start-query"], ["query"]) and \
+            not {"-h", "--help"} & set(words[c + 1:(words + ["--"]).index("--", c + 1)]):
+        # `yt start-query --stage production yql QUERY`: the query is the word after the engine, whatever option
+        # values sit among the positional words (those after `--` are positional too); without a literal engine it
+        # is the third word, as the usage has it. Without a query word the CLI stops at its own usage error.
+        named = pos + (words[words.index("--") + 1:] if "--" in words else [])
+        plain = [(expand(p, ctx) or [p])[0] for p in named]
+        engine = next((k for k, p in enumerate(plain) if k and p in YT_ENGINES), None)
+        found += [sql_word(p, ctx) for p in (named[engine + 1:engine + 2] if engine is not None else named[2:3])]
     if rule.get("sql_after_dashdash_with") in words and "--" in words:
         found += [sql_word(w, ctx) for w in words[words.index("--") + 1:] if not w.startswith("-")]
-    if cmd["pipe"] or any(op in ("<", "<<", "<<<") for op, _ in cmd["redir"]):
+    # A query given as an argument is the whole query: stdin is then data (`INSERT ... FORMAT TSV < rows`), not SQL.
+    # An empty one is no query: the client reads stdin.
+    given = any(values is None or any(t and t.strip() for t in values) for values in found)
+    if not given and (cmd["pipe"] or any(op in ("<", "<<", "<<<") for op, _ in cmd["redir"])):
         fed = fed_text(cmd, cwd, ctx)
         found.append([fed] if fed is not None else None)
     texts = [t for values in found if values for t in values if t]
-    return texts, any(values is None or None in values for values in found)
+    unknown = any(values is None or None in values for values in found)
+    # What a file held before the same text rewrote it still counts: becoming unknown must not hide a known write.
+    return texts + (ctx.get("priors", []) if unknown else []), unknown
 
 
 # git push: the options that take a value, and the mark of a destination the guard cannot tell.
@@ -1011,6 +1214,9 @@ def bash_rule(rule, cmd, c, ctx, script):
     if head not in rule.get("command", []):
         return False
     rules = ctx["rules"]
+    # `tool sub --help` prints the help and does nothing, for the CLIs the rules name in help_commands.
+    if head in rules.get("help_commands", []) and "--help" in words[c + 1:(words + ["--"]).index("--", c + 1)]:
+        return False
     pos, opts, values = split_args(head, words[c + 1:], rules)
     if "sub" in rule or "sub_regex" in rule:
         first = pos[0] if pos else ""
@@ -1064,8 +1270,10 @@ def bash_rule(rule, cmd, c, ctx, script):
                 return False
     if rule.get("sql"):
         texts, unknown = sql_texts(rule, cmd, c, head, pos, ctx)
-        if not any(sql_writes(t, rules) for t in texts) and not (unknown and not script):
-            return False
+        if not any(sql_writes(t, rules) for t in texts):
+            # Nothing to ask about in what can be read; a query the shell builds only when it runs is a match of
+            # its own kind, so that the rules can refuse it with a way out.
+            return UNKNOWN_SQL if unknown and not script else False
     return True
 
 
@@ -1098,23 +1306,74 @@ def functions(text):
     return "".join(out) + text[last:], found
 
 
+# Words that move a function's arguments: call_body follows a plain `shift`, any other one makes them unknown.
+SHIFT = re.compile(r"(?<![\w$./-])(?:shift(?:[ \t]+([0-9]+))?|set[ \t]+--)(?![\w./-])")
+UNKNOWN_ARG = '"${guard_unknown_argument}"'
+
+
 def call_body(body, args):
-    """A function body with the call's arguments in place of $1..$9, $@ and $*."""
-    def arg(match):
-        name = match.group(1) or match.group(2)
-        if name in ("@", "*"):
-            return " ".join(shlex.quote(a) for a in args)
-        n = int(name)
-        return shlex.quote(args[n - 1]) if 0 < n <= len(args) else "''"
-    return re.sub(r"\"?\$(?:\{([0-9@*])(?::-[^}]*)?\}|([0-9@*]))\"?", arg, body)
+    """A function body with the call's arguments in place of $1..$9, $@ and $*. A `shift` that stands as a plain
+    statement drops arguments for the text after it (`f="$1"; shift; run "$*"`); after any other one (in a loop or
+    a branch, behind `&&`) and after `set --` the arguments are unknown, as are the forms the guard does not work
+    out (`${@:2}`, `$#`)."""
+    def fill(text):
+        def arg(match):
+            if args is None:
+                return UNKNOWN_ARG
+            name = match.group(1) or match.group(2)
+            if name == "*" and match.group(0)[0] == match.group(0)[-1] == '"':
+                return shlex.quote(" ".join(args))  # "$*" is one word: the arguments joined
+            if name in ("@", "*"):
+                return " ".join(shlex.quote(a) for a in args)
+            n = int(name)
+            return shlex.quote(args[n - 1]) if 0 < n <= len(args) else "''"
+        text = re.sub(r"\"?\$(?:\{([0-9@*])(?::-[^}]*)?\}|([0-9@*]))\"?", arg, text)
+        return re.sub(r"\"?\$(?:\{(?:[0-9@*!][^}]*|#)\}|#(?![A-Za-z_{]))\"?", lambda m: UNKNOWN_ARG, text)
+
+    outside = code_indexes(body)
+    args, out, last = list(args), [], 0
+    for match in SHIFT.finditer(body):
+        before = blank_quotes(body[:match.start()])
+        # In a string, a comment, a heredoc body or an argument (`echo shift`) the word is text, not the command.
+        if match.start() not in outside or \
+                not re.search(r"(?:\A|[;\n&|({]|\b(?:do|then|else)[ \t])[ \t]*\Z", before):
+            continue
+        out.append(fill(body[last:match.start()]) + ":")
+        last = match.end()
+        plain = match.group(0).startswith("shift") and re.search(r"(?:\A|[;\n])[ \t]*\Z", before) and \
+            re.match(r"[ \t]*(?:[;\n]|\Z)", body[last:]) and all(
+                len(re.findall(opens, before)) == len(re.findall(closes, before))
+                for opens, closes in ((r"\bdo\b", r"\bdone\b"), (r"\bthen\b", r"\bfi\b"), (r"\bcase\b", r"\besac\b"),
+                                      (r"\(", r"\)"), (r"\{", r"\}")))
+        # A shift past the last argument fails and leaves them as they were: not a case to guess at.
+        count = int(match.group(1) or 1)
+        args = args[count:] if plain and args is not None and count <= len(args) else None
+    return "".join(out) + fill(body[last:])
 
 
-def destructive_reason(text, ctx, depth=0, script=False):
-    """(rule, command words) of the first destructive simple command in a shell text, or None."""
+def own_command(path, ctx):
+    """True when a script is one the rules name in tool_scripts: a file that is itself a command they watch
+    (`~/.local/bin/tool` for `tool`). The function it defines under that name is judged by the command's rules."""
+    full = os.path.realpath(os.path.join(ctx["cwd"] or "/", os.path.expanduser(path)))
+    return any(full == os.path.realpath(os.path.expanduser(tool)) for tool in ctx["rules"].get("tool_scripts", []))
+
+
+def destructive_reason(text, ctx, depth=0, script=False, tool=False):
+    """(rule, command words, True or UNKNOWN_SQL) of the first destructive simple command in a shell text, or None.
+    tool: the text is a script the rules name in tool_scripts."""
     if depth > 3:
         return None
     text, defined = functions(text)
-    ctx.setdefault("funcs", {}).update(defined)
+    # Shared by every nested text: the commands the rules watch, the functions that are such a command itself, and
+    # the names defined anywhere else. A name redefined outside the tool script is no longer the tool.
+    tools, inline = ctx.setdefault("tools", set()), ctx.setdefault("inline", set())
+    watched = ctx.setdefault("watched", {h for rule in ctx["rules"]["bash"] for h in rule.get("command", [])})
+    if not tool:
+        inline.update(defined)
+    ctx.setdefault("funcs", {}).update({name: body for name, body in defined.items() if not (tool and name in inline)})
+    ctx.setdefault("files", {})
+    ctx.setdefault("codes", [])
+    ctx.setdefault("priors", [])
     heads = ctx.setdefault("heads", set())
     try:
         commands = parse(text)
@@ -1139,15 +1398,18 @@ def destructive_reason(text, ctx, depth=0, script=False):
         c = command_index(words)
         if c < len(words):
             heads.add(base(words[c]))
-        if c < len(words) and words[c] in ctx.get("funcs", {}):
+        # A function that is a watched command itself (a tool script defines it) is judged by the rules below, not
+        # expanded into everything the tool might ever run; any other function is read with the call's arguments.
+        if c < len(words) and words[c] in ctx.get("funcs", {}) and (words[c] not in tools or words[c] in inline):
             found = destructive_reason(call_body(ctx["funcs"][words[c]], words[c + 1:]), dict(ctx, vars=dict(ctx["vars"])),
                                        depth + 1, script)
             if found:
                 return found
             continue
         for rule in ctx["rules"]["bash"]:
-            if bash_rule(rule, cmd, c, ctx, script):
-                return rule, words
+            hit = bash_rule(rule, cmd, c, ctx, script)
+            if hit:
+                return rule, words, hit
         if c >= len(words):
             continue
         for inner in nested(cmd, c, ctx["cwd"] or "/"):
@@ -1156,26 +1418,81 @@ def destructive_reason(text, ctx, depth=0, script=False):
                 return found
         path, body, shellish = script_body(cmd, c, ctx["cwd"] or "/")
         if body is not None and shellish:
-            found = destructive_reason(body, dict(ctx, vars={}), depth + 1, True)
+            own = own_command(path, ctx)
+            if own:
+                # The script is a command the rules watch: the function it defines under its own name is that
+                # command. Its other functions stay ordinary ones, whatever they are called, and a shell given the
+                # script with arguments calls the tool.
+                tools.update({base(path)} & set(functions(body)[1]) & watched)
+                rest = words[c + 1:]
+                if path != words[c] and base(words[c]) not in ("source", ".") and path in rest:
+                    call = " ".join(shlex.quote(w) for w in [base(path)] + rest[rest.index(path) + 1:])
+                    found = destructive_reason(call, dict(ctx, vars={}), depth + 1, script)
+                    if found:
+                        return found
+            found = destructive_reason(body, dict(ctx, vars={}), depth + 1, True, tool=own)
             if found:
                 return found
     return None
 
 
 def remember(cmd, ctx):
-    """Keep the text an echo, printf or cat-from-heredoc writes to a file, for later commands of the same text."""
-    words = cmd["words"]
+    """Keep what a command does to the files later commands of the same text read: the text an echo, printf or
+    cat-from-heredoc writes, and None (unknown) for a file anything else writes: a redirection target, what tee, cp,
+    mv, `sed -i` or an interpreter is given. Without it a query file the command regenerates would be judged by the
+    copy an earlier run left on disk."""
+    words, files = cmd["words"], ctx.setdefault("files", {})
+    lost = ctx["cwd"] in (None, TEMP)
     c = command_index(words)
     head = base(words[c]) if c < len(words) else ""
-    targets = [t for op, t in cmd["redir"] if op in (">", ">>", ">|")]
-    if not targets or head not in ("cat", "echo", "printf"):
-        return
-    text = fed_text(cmd, ctx["cwd"] or "/", ctx) if head == "cat" else \
-        " ".join(w for w in words[c + 1:] if not w.startswith("-"))
-    for target in targets:
-        names = expand(target, ctx)
-        if names and len(names) == 1 and text is not None and ctx["cwd"] not in (None, TEMP):
-            ctx.setdefault("files", {})[os.path.realpath(os.path.join(ctx["cwd"], os.path.expanduser(names[0])))] = text
+    args = [w for w in words[c + 1:] if not w.startswith("-")]
+
+    def paths(word):
+        """Files a word names; a relative one under a lost working directory is none the guard can follow."""
+        names = [os.path.expanduser(n) for n in expand(word, ctx) or [] if n and not n.startswith(TEMP)]
+        return [os.path.realpath(os.path.join(ctx["cwd"] or "/", n)) for n in names if os.path.isabs(n) or not lost]
+
+    def forget(full):
+        """The file is unknown from here on, and so is everything known under it. What it held is kept aside:
+        a write seen there once still counts when the content can no longer be read (sql_texts)."""
+        for known in [full] + [k for k in files if k.startswith(full + os.sep)]:
+            if isinstance(files.get(known), str):
+                ctx.setdefault("priors", []).append(files[known])
+            files[known] = None
+
+    text = None
+    if head in ("cat", "echo", "printf"):
+        text = fed_text(cmd, ctx["cwd"] or "/", ctx) if head == "cat" else " ".join(args)
+    for op, target in cmd["redir"]:
+        # `2>&1` and `>&-` move descriptors; any other redirection with `>` writes the file it names, be the name
+        # digits or not.
+        if ">" not in op or op.endswith("&") and (target.isdigit() or target == "-"):
+            continue
+        found = paths(target)
+        for full in found:
+            if text is None or len(found) != 1:
+                forget(full)
+            elif op.startswith(">>"):
+                # An append adds to what an earlier command of the text wrote, or to the file as it is now.
+                prior = read_text(full, ctx, "/") if full in files or os.path.exists(full) else ""
+                if prior is None:
+                    forget(full)
+                else:
+                    files[full] = prior + "\n" + text
+            else:
+                files[full] = text
+    written = args if head == "tee" or head in INTERPRETERS else args[-1:] if head in COPIERS | {"mv", "install"} else \
+        args if head in ("sed", "perl") and any(re.match(r"^-[A-Za-z]*i", w) for w in words[c + 1:]) else []
+    for word in written:
+        for full in paths(word):
+            forget(full)
+    if head in INTERPRETERS:
+        # Inline code (`python3 - <<EOF`, `-c`) may write any file it names: those known so far are unknown now.
+        codes = [code for code in [fed_text(cmd, ctx["cwd"] or "/", ctx)] +
+                 [a for a in words[c + 1:] if " " in a or "\n" in a] if code]
+        ctx.setdefault("codes", []).extend(codes)
+        for known in [k for k in files if any(base(k) in code for code in codes)]:
+            forget(known)
 
 
 def track(words, ctx):
@@ -1231,6 +1548,9 @@ def mcp_rule(rule, tool, data, rules):
             return False
         if "equals" in when and value != when["equals"]:
             return False
+        # Anything but a list here is no exception at all: the rule keeps matching.
+        if isinstance(when.get("not_in"), list) and value in when["not_in"]:
+            return False
     if "sql_field" in rule:
         sql = field(data, rule["sql_field"])
         if isinstance(sql, str) and not sql_writes(sql, rules):
@@ -1255,7 +1575,7 @@ def decide_destructive(event, env, rules_path=RULES_FILE, rules=None):
     except (OSError, ValueError) as error:
         return "warn", f"agent-worker-guard: cannot read the rules {rules_path} ({error}); the destructive-action guard is off"
     tool, data = event.get("tool_name", ""), event.get("tool_input") or {}
-    found = None
+    found = kind = None
     if tool in ("Bash", "mcp__terminal__run_in_terminal"):
         roots = scratch_roots(rules, str(event.get("session_id") or ""))
         if event.get("scratchpad_dir"):
@@ -1265,7 +1585,7 @@ def decide_destructive(event, env, rules_path=RULES_FILE, rules=None):
         command = str(data.get("command") or "")
         hit = destructive_reason(command, ctx)
         if hit:
-            found = hit[0], " ".join(hit[1])[:200]
+            found, kind = (hit[0], " ".join(hit[1])[:200]), hit[2]
         else:
             # Safety net: a command the rules watch shows up in the raw text, but the parser never saw it run.
             watched = {h for r in rules["bash"] for h in r.get("command", []) + r.get("launcher", [])} | {"codex"}
@@ -1279,11 +1599,27 @@ def decide_destructive(event, env, rules_path=RULES_FILE, rules=None):
     if not found:
         return None
     rule, what = found
-    decision = rules.get("decision", "ask")
-    if event.get("permission_mode") in rules.get("deny_in_permission_modes", []):
+    decision, key = rules.get("decision", "ask"), "rule"
+    # A query the guard could not read: the rules may refuse it with a way out instead of asking the user blind.
+    if kind == UNKNOWN_SQL and rules.get("unknown_sql_decision") == "deny":
+        decision, key = "deny", "unknown_sql"
+    # A harness whose hooks cannot ask (Codex) gets a refusal that says whose decision it is.
+    if event.get("permission_mode") in rules.get("deny_in_permission_modes", []) or \
+            not (event.get("harness") or {}).get("ask", True):
         decision = "deny"
     message = rules.get("ask_message" if decision == "ask" else "message", "")
-    return decision, text("rule", message=message, id=rule["id"], why=rule["why"], what=what)
+    return decision, text(key, message=message, id=rule["id"], why=rule["why"], what=what)
+
+
+def normalize(event, harness=None):
+    """The hook event with "harness": what the calling harness can honor. It is the one named on the command line,
+    else Codex when the event carries its turn_id, else Claude Code. Both send the shell tool as "Bash" with the
+    command in one string and MCP tools as mcp__server__tool, so the event itself needs no rewriting; a harness
+    that names things differently gets its translation here."""
+    event = dict(event) if isinstance(event, dict) else {}
+    name = harness or ("codex" if "turn_id" in event else "claude")
+    event["harness"] = dict(HARNESSES.get(name, {"ask": False}), name=name)
+    return event
 
 
 def respond(decision, reason):
@@ -1532,6 +1868,39 @@ SAFE = [
     # Real comments stay comments; quoted or commented commands are not run.
     "ls # rm -rf /", "git status # && git push --force", "grep -rn 'git push --force' .",
     "echo ${#x} ${p#pre} https://example.com/#top",
+    # SQL comments and strings are read in one pass: an apostrophe in a comment opens no string.
+    "clickhouse client -q \"-- today's rows\nSELECT a FROM t WHERE b = 'x' GROUP BY a\"",
+    "clickhouse client -q \"/* don't */ SELECT 1\"",
+    # A ClickHouse temporary table lives in the session only.
+    "clickhouse client -q 'CREATE TEMPORARY TABLE tmp_x AS SELECT 1; INSERT INTO tmp_x SELECT 2; "
+    "SELECT * FROM tmp_x; DROP TEMPORARY TABLE tmp_x'",
+    "clickhouse client -q \"SELECT 1 # note; that's fine\"",
+    # `shift` moves the arguments of a helper function; the word in a string moves nothing.
+    "q() { local f=\"$1\"; shift; clickhouse client -q \"$*\" > {S}/out.txt; }; q a.txt \"SHOW TABLES\"; q b.txt 'SELECT 1'",
+    "q() { printf '%s\\n' 'shift'; clickhouse client -q \"$1\"; }; q 'SELECT 1'",
+    "q() { echo shift; clickhouse client -q \"$1\"; }; q 'SELECT 1'",
+    # A quoted or escaped operator character is a word.
+    "grep -c ';' {S}/q.sql", "tr '|' ' ' < {S}/q.sql", "find {S} -name x -exec ls {} \\;",
+    # A file the text itself writes is read as written: an append adds to what was there.
+    "echo 'SELECT 1' > {S}/q8.sql; echo 'UNION ALL SELECT 2' >> {S}/q8.sql; clickhouse client < {S}/q8.sql",
+    "python3 -c 'print(1)'; echo 'SELECT 1' > {S}/q6.sql; clickhouse client --queries-file {S}/q6.sql",
+    # A query in the arguments is the whole query: stdin is not read as SQL.
+    "clickhouse client -q 'SELECT 1' < /dev/null",
+    # `yt start-query`: the query follows the engine, whatever option values come before.
+    "yt start-query --stage production yql 'SELECT 1'",
+    "yt --proxy cluster start-query --settings '{a=1}' yql \"$(cat {S}/q.sql)\"",
+    "engine=yql; yt start-query \"$engine\" 'SELECT 1'",
+    "yt start-query -- yql 'SELECT 1'",
+    "yt start-query --help",
+    "yt start-query yql <<<'SELECT 1'",
+    # A line of a heredoc is text, whatever it says; quoted operators side by side are one word.
+    "q() { cat <<EOF\nshift\nEOF\nclickhouse client -q \"$1\"; }; q 'SELECT 1' 'not SQL'",
+    "printf '%s' ';'';' yt start-query",
+    # The descriptor number of a redirection is not a word of the command.
+    "rm -rf {S}/build 2>/dev/null", "cd {O} && rm -rf {S}/x 2>&1",
+    # A heredoc inside `$(...)` is one even in double quotes; its body is text.
+    "x=\"$(cat <<'EOF'\nSELECT 1 -- rm -rf /\nEOF\n)\"; clickhouse client -q \"$x\"",
+    "python3 - <<'EOF'\nprint(\"<<EOF is text here\")\nEOF\nls",
 ]
 DESTRUCTIVE = [
     "rm -rf {O}/project",
@@ -1600,6 +1969,92 @@ DESTRUCTIVE = [
     "echo \"${#x}\"; git push --force origin main", "echo 'a # b'; rm -rf {O}/x",
     # Safety net: the parser cannot read this line (an unclosed quote), but it runs a watched command.
     "rm -rf {O}/data 'unclosed",
+    # A SQL comment cannot hide a statement in a string it seems to open, nor a string in a comment.
+    "clickhouse client -q \"/* don't */ DROP TABLE t\"",
+    "clickhouse client -q \"-- it's\nDROP TABLE x; -- don't\"",
+    "clickhouse client -q \"# it's\nDROP TABLE x; -- don't\"",
+    # A temporary table covers one DROP TEMPORARY of its own plain name, nothing else.
+    "clickhouse client -q 'CREATE TEMPORARY TABLE tmp_x AS SELECT 1; DROP TEMPORARY TABLE tmp_x; DROP TEMPORARY TABLE tmp_x'",
+    "clickhouse client -q 'CREATE TEMPORARY TABLE tmp_x AS SELECT 1; DROP TABLE tmp_x'",
+    "clickhouse client -q 'CREATE TEMPORARY TABLE tmp_x AS SELECT 1; DROP TEMPORARY TABLE tmp_x, prod'",
+    "clickhouse client -q 'CREATE TEMPORARY TABLE `a` AS SELECT 1; DROP TEMPORARY TABLE `prod`'",
+    # `shift`: the query is the argument left after it; after one in a loop, after `set --` and in the forms the
+    # guard does not work out it is unknown.
+    "q() { local n=\"$1\"; shift; clickhouse client -q \"$1\"; }; q 'SELECT 1' 'DROP TABLE t'",
+    "q() { while [ $# -gt 1 ]; do shift; done; clickhouse client -q \"$1\"; }; q a 'SELECT 1'",
+    "q() { set -- \"$2\" \"$1\"; clickhouse client -q \"$1\"; }; q 'SELECT 1' 'DROP TABLE t'",
+    "q() { clickhouse client -q \"${@:2}\"; }; q x 'DROP TABLE t'",
+    "q() { clickhouse client -q \"$*\"; }; q SELECT 1 \\; DROP TABLE t",
+    # A quoted operator character does not end the command: the words after it are still its arguments.
+    "rm -rf ';' {O}/data", "rm -rf '&' {O}/data", "rm -rf \"|\" {O}/data", "find {O} -name x -exec rm -rf {} \\;",
+    # A query file the same text rewrites is not the copy an earlier run left on disk: its content is unknown.
+    "python3 gen.py > {S}/q.sql; clickhouse client --queries-file {S}/q.sql",
+    "sed -i '' 's/SELECT 1/DROP TABLE t/' {S}/q.sql; clickhouse client --queries-file {S}/q.sql",
+    "cp {O}/other.sql {S}/q.sql && clickhouse client < {S}/q.sql",
+    "python3 gen.py {S}/q.sql; clickhouse client -q \"$(cat {S}/q.sql)\"",
+    "python3 gen.py {S}; clickhouse client --queries-file {S}/q.sql",
+    # A later write undoes what an earlier command of the text made known, in the order they run.
+    "echo 'SELECT 1' > {S}/q7.sql; python3 -c 'open(\"q7.sql\", \"w\").write(\"DROP TABLE t\")'; "
+    "clickhouse client --queries-file {S}/q7.sql",
+    "echo 'SELECT 1' > {S}/build/q.sql; python3 gen.py {S}/build; clickhouse client --queries-file {S}/build/q.sql",
+    "cd \"$NOWHERE\"; python3 gen.py > {S}/q.sql; clickhouse client --queries-file {S}/q.sql",
+    "python3 - <<'EOF'\nopen('q.sql', 'w').write('DROP TABLE t')\nEOF\ncd {S} && clickhouse client --queries-file q.sql",
+    "echo 'DROP TABLE x;' > {S}/q9.sql; echo 'SELECT 1' >> {S}/q9.sql; clickhouse client < {S}/q9.sql",
+    # Temporary tables: names are case-sensitive, and another engine may write outside the session.
+    "clickhouse client -q 'CREATE TEMPORARY TABLE demo AS SELECT 1; INSERT INTO Demo SELECT 2'",
+    "clickhouse client -q \"CREATE TEMPORARY TABLE t2 ENGINE = S3('u') AS SELECT 1\"",
+    "clickhouse client -q 'CREATE TEMPORARY TABLE db AS SELECT 1; INSERT INTO db . real SELECT 2'",
+    # A shift past the last argument fails and leaves them; a `shift` line in a heredoc shifts nothing.
+    "q() { shift 2; clickhouse client -q \"$1\"; }; q 'DROP TABLE t'",
+    "q() { cat <<EOF\nshift\nEOF\nclickhouse client -q \"$1\"; }; q 'DROP TABLE t' 'SELECT 1'",
+    # A redirection writes the file it names, be the name digits; `--queries-file=` is the option with a value.
+    "cd {S} && echo 'DROP TABLE t' > 1 && clickhouse client < 1",
+    "clickhouse client --queries-file={O}/drop.sql",
+    "clickhouse client --queries-file={O}/unknown.sql",
+    "yt start-query --stage production yql 'DROP TABLE `//home/x`'",
+    "yt start-query --stage production yql \"$Q\"",
+    "yt start-query -- yql 'DROP TABLE `//home/x`'",
+    "echo 'DROP TABLE x' | clickhouse client",
+    "echo 'DROP TABLE x' | clickhouse client -q ''",
+    "rm -rf {O}/data 2>/dev/null",
+    # `<<WORD` in quotes or in a comment is not a heredoc: the lines after it are still commands.
+    "echo \"see <<EOF\"\nrm -rf {O}/data",
+    "sed -E 's/<<NAME:[^>]+>>/x/' a.sql > b.sql\nyt remove //home/x",
+    "ls # <<EOF\nrm -rf {O}/data",
+    "x=\"$(cat <<'EOF'\nDROP TABLE t\nEOF\n)\"; clickhouse client -q \"$x\"",
+]
+# With sql_ask "destructive": statements that only add go through, what removes or overwrites still asks, and a
+# query the guard cannot read is refused (unknown_sql_decision "deny").
+ADDS = [
+    "clickhouse client -q 'SELECT 1'",
+    "clickhouse client -q 'INSERT INTO t SELECT 1'",
+    "clickhouse client -q 'CREATE TABLE IF NOT EXISTS t (x Int8) ENGINE = Memory'",
+    "clickhouse client -q 'CREATE TABLE t ENGINE = ReplacingMergeTree ORDER BY x AS SELECT 1 AS x'",
+    "clickhouse client -q 'CREATE VIEW v AS SELECT 1'",
+    "clickhouse client -q 'INSERT INTO t SELECT truncate(x, 2) FROM s'",
+    "clickhouse client -q 'SELECT 1 AS s3_truncate_on_insert'",
+    "clickhouse client -q 'INSERT INTO t SELECT 1 SETTINGS s3_truncate_on_insert = 0'",
+    "yt start-query yql 'INSERT INTO `//home/x` SELECT 1'",
+    "yt start-query yql 'DEFINE ACTION $a() AS INSERT INTO `//x` SELECT 1; END DEFINE; DO $a()'",
+]
+REMOVES = [
+    "clickhouse client -q 'DROP TABLE t'",
+    "clickhouse client -q 'TRUNCATE TABLE t'",
+    "clickhouse client -q 'ALTER TABLE t DELETE WHERE 1'",
+    "clickhouse client -q 'ALTER TABLE t ADD COLUMN y Int8'",
+    "clickhouse client -q 'RENAME TABLE a TO b'",
+    "clickhouse client -q 'CREATE OR REPLACE TABLE t (x Int8) ENGINE = Memory'",
+    "clickhouse client -q 'INSERT OVERWRITE TABLE t SELECT 1'",
+    "clickhouse client -q 'CREATE USER u'",
+    "clickhouse client -q 'OPTIMIZE TABLE t FINAL'",
+    "clickhouse client -q 'KILL QUERY WHERE 1'",
+    "clickhouse client -q 'INSERT INTO t SELECT 1; DROP TABLE t'",
+    "yt start-query yql 'INSERT INTO `//home/x` WITH TRUNCATE SELECT 1'",
+    "yt start-query yql 'DEFINE ACTION $a() AS INSERT INTO `//x` WITH TRUNCATE SELECT 1; END DEFINE; DO $a()'",
+    "yt start-query yql 'DROP TABLE `//home/x`'",
+    "clickhouse client -q \"INSERT INTO FUNCTION s3('u', 'TSV') SELECT 1 SETTINGS s3_truncate_on_insert = 1\"",
+    "clickhouse client -q 'SET s3_truncate_on_insert = 1; INSERT INTO FUNCTION s3(1) SELECT 1'",
+    "clickhouse client -q \"$Q\"",
 ]
 MCP_CASES = [
     ("mcp__clickhouse__run_query", {'query': 'SELECT 1'}, False),
@@ -1727,7 +2182,7 @@ GIT_PUSH_CASES = [
 
 
 def selftest(rules_path=RULES_FILE):
-    global SETTINGS, DESTRUCTIVE_FLAG
+    global SETTINGS, DESTRUCTIVE_FLAG, CODEX_HOOKS
     import tempfile
     failures, total = [], 0
     # The rules (and their local addition with its own cases) also decide what counts as a launcher.
@@ -1754,6 +2209,14 @@ def selftest(rules_path=RULES_FILE):
             f.write("#!/bin/bash\ncomp=$HOME/p/scripts/codex-companion.mjs\nnode \"$comp\" task --json x\n")
         with open(os.path.join(d, "wipe.sh"), "w") as f:
             f.write(f"#!/bin/zsh\nrm -rf {outside_dir}/data\n")
+        # Stale copies a careless reading would trust: a query file named by a number, one outside the scratchpad.
+        with open(os.path.join(scratch, "1"), "w") as f:
+            f.write("SELECT 1;\n")
+        with open(os.path.join(outside_dir, "drop.sql"), "w") as f:
+            f.write("DROP TABLE t;\n")
+        with open(os.path.join(d, "rewrite.sh"), "w") as f:
+            f.write("#!/bin/bash\necho 'DROP TABLE t' > q2.sql\npython3 -c 'print(open(\"q2.sql\").read())'\n"
+                    "clickhouse client --queries-file q2.sql\n")
         os.makedirs(os.path.join(d, "x/agent-worker-router/scripts"))
         with open(os.path.join(d, "x/agent-worker-router/scripts/agent-worker-router"), "w") as f:
             f.write("#!/bin/zsh\ncompanion=$root/scripts/codex-companion.mjs\nnode \"$companion\" task --json\n")
@@ -1782,13 +2245,33 @@ def selftest(rules_path=RULES_FILE):
             data = data if isinstance(data, dict) else {"command": data}
             if bool(protect({"tool_name": tool, "tool_input": data})) != deny:
                 failures.append(f"protect {tool} {json.dumps(data)[:110]}: expected {'deny' if deny else 'allow'}")
-        saved = SETTINGS, DESTRUCTIVE_FLAG
+        saved = SETTINGS, DESTRUCTIVE_FLAG, CODEX_HOOKS
         SETTINGS = os.path.join(d, "config", "settings.json")
         DESTRUCTIVE_FLAG = os.path.join(d, "config", "allow-destructive")
+        CODEX_HOOKS = os.path.join(d, "codex", "hooks.json")
         os.makedirs(os.path.join(d, "config"))
+        os.makedirs(os.path.join(d, "codex"))
         with open(SETTINGS, "w") as f:
             json.dump(SETTINGS_FIXTURE, f, indent=2)
+        with open(CODEX_HOOKS, "w") as f:
+            json.dump({"hooks": SETTINGS_FIXTURE["hooks"]}, f, indent=2)
         try:
+            # Codex: its hooks.json registers the guard as the Claude settings do; apply_patch is its file edit.
+            patch = "*** Begin Patch\n*** Update File: {}\n@@\n-x\n+y\n*** End Patch"
+            for tool, data, deny in [
+                    ("Write", {"file_path": CODEX_HOOKS, "content": "{}"}, True),
+                    ("Write", {"file_path": CODEX_HOOKS, "content": json.dumps({"hooks": SETTINGS_FIXTURE["hooks"]})}, False),
+                    ("apply_patch", {"command": patch.format(CODEX_HOOKS)}, True),
+                    ("apply_patch", {"command": patch.format(SETTINGS)}, True),
+                    ("apply_patch", {"command": patch.format(os.path.join(d, "codex", "destructive-rules.json"))}, True),
+                    ("apply_patch", {"command": patch.format(os.path.join(d, "notes.md"))}, False),
+                    ("Bash", {"command": f"mv /tmp/h {CODEX_HOOKS}"}, True),
+                    ("Bash", {"command": f"cp /tmp/hooks.json {os.path.dirname(CODEX_HOOKS)}/"}, True),
+                    ("Bash", {"command": f"cat {CODEX_HOOKS}"}, False),
+                    ("Bash", {"command": f"jq . {os.path.join(d, 'plugin', 'hooks.json')}"}, False)]:
+                total += 1
+                if bool(protect({"tool_name": tool, "tool_input": data, "cwd": d})) != deny:
+                    failures.append(f"codex settings {tool} {json.dumps(data)[:110]}: expected {'deny' if deny else 'allow'}")
             for tool, data, deny in SETTINGS_CASES:
                 total += 1
                 data = data if isinstance(data, dict) else {"command": data}
@@ -1802,7 +2285,7 @@ def selftest(rules_path=RULES_FILE):
                     protect({"tool_name": "Bash", "tool_input": {"command": f"mv /tmp/s {SETTINGS}"}, "cwd": d}):
                 failures.append("allow-destructive must open the settings to edits")
         finally:
-            SETTINGS, DESTRUCTIVE_FLAG = saved
+            SETTINGS, DESTRUCTIVE_FLAG, CODEX_HOOKS = saved
         # Local rules: a rule with a known id replaces it, the rest adds up; the file next to the rules is read.
         total += 1
         merged = {"bash": [{"id": "a", "why": "1"}], "mcp": [], "worker_deny_commands": ["x"],
@@ -1821,27 +2304,74 @@ def selftest(rules_path=RULES_FILE):
                 [r["id"] for r in load_rules(os.path.join(d, "merge", "destructive-rules.json"))["bash"]] != ["a", "c"]:
             failures.append("local rules merge")
         rules["scratchpad_globs"] = [os.path.join(d, "claude", "{session_id}")]
-        test_rules = os.path.join(d, "rules.json")
-        with open(test_rules, "w") as f:
-            json.dump(rules, f)
-        cases = [(c, False) for c in SAFE + local.get("safe", [])] + \
-                [(c, True) for c in DESTRUCTIVE + local.get("destructive", [])] + [
-            (f"bash {d}/wipe.sh", True), ("bash ok.sh", False), ("zsh " + os.path.join(d, "run.sh"), False)]
-        for command, destructive in cases:
+        # A script that is itself a watched command: the rules judge its calls, its code is not scanned. The same
+        # file anywhere else is a script like any other, and the `sudo` in its function is found.
+        tool = "#!/usr/bin/env zsh\n_setup() { sudo true; }\nyt() { _setup; command yt \"$@\"; }\n" \
+               "git() { rm -rf " + outside_dir + "/data; }\n" \
+               "[[ \"$ZSH_EVAL_CONTEXT\" == toplevel ]] && { yt \"$@\"; exit $?; }\n"
+        for folder in ("tool", "other"):
+            os.makedirs(os.path.join(d, folder))
+            with open(os.path.join(d, folder, "yt"), "w") as f:
+                f.write(tool)
+        rules["tool_scripts"] = rules.get("tool_scripts", []) + [os.path.join(d, "tool", "yt")]
+        # The built-in tables hold for the default settings, the local rules' own cases for the settings they chose.
+        test_rules, plain_rules, narrow_rules = (os.path.join(d, name) for name in ("rules.json", "plain.json", "narrow.json"))
+        for path, settings in ((test_rules, {}), (plain_rules, {"sql_ask": None, "unknown_sql_decision": None}),
+                               (narrow_rules, {"sql_ask": "destructive", "unknown_sql_decision": "deny"})):
+            with open(path, "w") as f:
+                json.dump({k: v for k, v in {**rules, **settings}.items() if v is not None}, f)
+        cases = [(c, False, plain_rules) for c in SAFE] + [(c, True, plain_rules) for c in DESTRUCTIVE] + \
+                [(c, False, test_rules) for c in local.get("safe", [])] + \
+                [(c, True, test_rules) for c in local.get("destructive", [])] + \
+                [(c, False, narrow_rules) for c in ADDS] + [(c, True, narrow_rules) for c in REMOVES] + [
+            (f"bash {d}/wipe.sh", True, plain_rules), ("bash ok.sh", False, plain_rules),
+            # In a script too: what a file held before the script rewrote it is still a write.
+            (f"bash {d}/rewrite.sh", True, plain_rules),
+            # Only the function named like the tool script is the tool; another watched name in it is read as usual.
+            (f"source {d}/tool/yt; git status", True, plain_rules),
+            ("zsh " + os.path.join(d, "run.sh"), False, plain_rules),
+            (f"source {d}/tool/yt; yt list //home", False, plain_rules),
+            (f"source {d}/tool/yt; yt remove //x", True, plain_rules),
+            (f"{d}/tool/yt list //home", False, plain_rules), (f"{d}/tool/yt remove //x", True, plain_rules),
+            (f"zsh {d}/tool/yt list //home", False, plain_rules), (f"zsh {d}/tool/yt remove //x", True, plain_rules),
+            (f"source {d}/tool/yt; _setup", True, plain_rules),
+            # Redefined after the tool script was sourced, the name is an ordinary function again.
+            (f"source {d}/tool/yt; yt() {{ rm -rf {outside_dir}/data; }}; yt list //home", True, plain_rules),
+            (f"source {d}/other/yt; yt list //home", True, plain_rules)]
+        for command, destructive, rules_file in cases:
             total += 1
             command = command.replace("{S}", scratch).replace("{O}", outside_dir)
             event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": d, "session_id": session,
                      "permission_mode": "bypassPermissions"}
-            got = decide_destructive(event, {}, test_rules)
+            got = decide_destructive(event, {}, rules_file)
             if bool(got) != destructive:
                 failures.append(f"destructive {command[:110]!r}: expected {'ask' if destructive else 'allow'}, got {got}")
         total += 1
         event = {"tool_name": "Bash", "tool_input": {"command": f"rm -rf {d}/pad/x"}, "cwd": d, "scratchpad_dir": f"{d}/pad"}
         if decide_destructive(event, {}, test_rules):
             failures.append("scratchpad_dir from the hook input must count as the scratchpad")
-        for tool, data, destructive in MCP_CASES + [tuple(case) for case in local.get("mcp", [])]:
+        # A query the guard cannot read: asked about by default, refused with the way out when the rules say so.
+        total += 1
+        event = {"tool_name": "Bash", "tool_input": {"command": 'clickhouse client -q "$Q"'}, "cwd": d}
+        if [v and v[0] for v in (decide_destructive(event, {}, plain_rules), decide_destructive(event, {}, narrow_rules))] \
+                != ["ask", "deny"]:
+            failures.append("an unreadable query must ask by default and be refused under unknown_sql_decision deny")
+        # Harnesses: Codex cannot honor "ask" from a hook, so a match is a refusal there (named, or told by turn_id).
+        total += 1
+        event = {"tool_name": "Bash", "tool_input": {"command": f"rm -rf {outside_dir}/x"}, "cwd": d}
+        if [v and v[0] for v in (decide_destructive(normalize(event, "claude"), {}, plain_rules),
+                                 decide_destructive(normalize(event), {}, plain_rules),
+                                 decide_destructive(normalize(event, "codex"), {}, plain_rules),
+                                 decide_destructive(normalize(dict(event, turn_id="t"), None), {}, plain_rules),
+                                 decide_destructive(normalize(event, "other"), {}, plain_rules))] \
+                != ["ask", "ask", "deny", "deny", "deny"]:
+            failures.append("harness: ask under Claude Code, a refusal under Codex and under a harness not listed")
+        for tool, data, destructive, rules_file in \
+                [(*case, plain_rules) for case in MCP_CASES] + [(*case, test_rules) for case in local.get("mcp", [])] + [
+                    ("mcp__clickhouse__run_query", {"query": "INSERT INTO t VALUES (1)"}, False, narrow_rules),
+                    ("mcp__clickhouse__run_query", {"query": "DROP TABLE t"}, True, narrow_rules)]:
             total += 1
-            got = decide_destructive({"tool_name": tool, "tool_input": data, "cwd": d}, {}, test_rules)
+            got = decide_destructive({"tool_name": tool, "tool_input": data, "cwd": d}, {}, rules_file)
             if bool(got) != destructive:
                 failures.append(f"mcp {tool} {json.dumps(data)[:90]}: expected {'ask' if destructive else 'allow'}, got {got}")
         repos, isolated = os.path.join(d, "repos"), ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CEILING_DIRECTORIES")
@@ -1890,7 +2420,8 @@ def selftest(rules_path=RULES_FILE):
     for line in failures:
         print("FAIL", line)
     print(f"agent-worker-guard selftest: {total - len(failures)}/{total} OK "
-          f"({len(SAFE)} safe commands, {len(DESTRUCTIVE)} destructive, {len(MCP_CASES)} MCP calls, "
+          f"({len(SAFE)} safe commands, {len(DESTRUCTIVE)} destructive, {len(ADDS) + len(REMOVES)} for sql_ask, "
+          f"{len(MCP_CASES)} MCP calls, "
           f"{len(SETTINGS_CASES)} settings edits, {len(GIT_PUSH_CASES)} git pushes; "
           f"{sum(len(v) for v in local.values() if isinstance(v, list))} cases from the local rules)")
     return 1 if failures else 0
@@ -1900,8 +2431,13 @@ def main():
     args = sys.argv[1:]
     if args[:1] == ["--selftest"]:
         return selftest(*args[1:2])
+    harness = None
+    if "--harness" in args:
+        k = args.index("--harness")
+        harness = (args[k + 1:k + 2] or [None])[0]
+        del args[k:k + 2]
     try:
-        event = json.load(sys.stdin)
+        event = normalize(json.load(sys.stdin), harness)
         try:
             rules = load_rules()
             configure(rules)

@@ -7,12 +7,29 @@ Two policies, one hook entry each:
   agent-worker-guard --all          both, for a single hook entry
   agent-worker-guard --selftest [RULES]  decision tables of both policies, the local rules' own cases included
   ... --harness claude|codex        the harness that calls the hook; without it Codex is told by its turn_id
+  ... --native-prompt --reply       under Codex: the routes to the user's decision (below)
+  agent-worker-guard --confirm RULE TOKEN   succeeds when Codex has asked the user about this line (route A)
 
 Harnesses. The hook speaks the PreToolUse command-hook protocol of Claude Code, which Codex adopted: the same event
 on stdin, the same hookSpecificOutput on stdout. What differs is kept in one table (HARNESSES) and one function
 (normalize): Codex cannot honor "ask" from a hook (it runs the call), so there a match is a refusal that names whose
 decision it is; it edits files with apply_patch; its hooks live in hooks.json. Codex has no PreToolUse event for
 write_stdin and lets a call through when a hook crashes or times out: there the guard is a net, not a wall.
+
+Approval under Codex. Two routes turn that refusal into the user's decision. Each is switched on by its flag and
+needs its hook entries; one command line serves every event, the guard reads hook_event_name.
+A, --native-prompt: when the approval policy lets Codex ask (permission_mode is not bypassPermissions), a shell
+call is rewritten to `agent-worker-guard --confirm RULE TOKEN && eval 'command'`. The exec-policy rule
+prefix_rule(pattern=[guard, "--confirm"], decision="prompt") in $CODEX_HOME/rules makes Codex show its own
+approval prompt for the line, a PermissionRequest entry for Bash lets the guard note that Codex asked, and
+--confirm succeeds only with that note: with a rule that is not in effect it fails and the shell does not go on
+to the command. The command itself runs in the same shell Codex started, as it would have without the guard.
+B, --reply: any other call is refused with a four-digit code and a request to ask the user in plain text. The
+user's own message that is just that code, seen by a UserPromptSubmit entry, allows the call, and the same call
+repeated unchanged passes once. Only a message typed into the session that asked counts: the prompt of a spawned
+agent is written by a model. The question is plain text because Codex tells its model not to use
+request_user_input for permissions.
+Notes and approvals live in guard-approvals next to the rules, a day at most.
 
 Codex policy. A direct launch (codex exec/review/app-server, codex-companion.mjs task/review, the
 codex:codex-rescue agent) runs with the user's whole Codex config: every MCP server, its sandbox and approval
@@ -37,6 +54,7 @@ The hook sees only tool calls of Claude sessions: manual runs in a terminal neve
 allow the call, so a broken guard cannot break every tool call; unreadable rules say so to the user.
 """
 import glob
+import hashlib
 import json
 import os
 import re
@@ -59,8 +77,30 @@ SETTINGS_NAME = r"(?:settings(?:\.local)?|hooks)\.json"
 HARNESSES = {"claude": {"ask": True}, "codex": {"ask": False}}
 GUARD_ENV = ("AGENT_WORKER_GUARD", "AGENT_DESTRUCTIVE_GUARD")
 FLAG_TTL = 15 * 60
-# The guard's words; the rules' "messages" table may replace any of them (codex_why, codex_use, codex_launch,
-# codex_agent, protect, rule, unknown_sql).
+# One-time approvals under Codex: what Codex asked about (TOKEN.asked, route A) and what the user was asked and
+# answered (CODE.json, route B). A note is good for ASKED_TTL, an approval for APPROVAL_TTL, nothing stays longer
+# than STORE_TTL.
+APPROVALS = os.path.join(CONFIG, "guard-approvals")
+APPROVAL_TTL = 10 * 60
+ASKED_TTL = 60 * 60
+STORE_TTL = 24 * 3600
+# The exec-policy rule file of route A in $CODEX_HOME/rules, protected like the rules.
+PROMPT_RULES = "agent-worker-guard.rules"
+# The modes in which the guard writes or uses an approval: Codex runs them, an agent does not.
+ROUTE_FLAGS = ("--confirm", "--native-prompt", "--reply")
+# Route B: the user's whole message is the code of a request, alone or after one word of consent.
+REPLY = re.compile(r"\W*(?:(?:guard|ok|ок|yes|да|code|код)\W+)?([0-9]{4})\W*", re.I)
+# The IDE extension puts its own context before the user's words, under this heading.
+IDE_REQUEST = "## My request for Codex:"
+# How much of a call a refusal quotes before it leaves the middle out.
+SHOWN_CALL = 1200
+# A command name Codex's exec-policy parser reads as it is spelled: quoted or expandable, the wrapper line of
+# route A would not match its rule.
+PLAIN_WORD = re.compile(r"[A-Za-z0-9_@%+:,./-]+")
+# What --confirm returns for a line Codex did not ask about: an ordinary failure, not a code a shell or Codex
+# gives a meaning to (126 and 127 are "cannot run", which invites a retry outside the sandbox).
+CONFIRM_REFUSED = 3
+# The guard's words; the rules' "messages" table may replace any of them.
 MESSAGES = {
     "codex_why": "A direct launch runs with the whole Codex config: every MCP server, its sandbox and approval "
                  "settings, a shared broker.",
@@ -75,6 +115,21 @@ MESSAGES = {
                    "substitution or a file this same command writes. Save the SQL to a file in a separate call, then "
                    "run it from that file by its absolute path: the guard reads the file itself. Rule {id}. "
                    "Command: {what}",
+    "confirm": "The guard's approval modes (--confirm, --native-prompt, --reply) are run by Codex for its own "
+               "events; an agent does not call them.",
+    "not_asked": "agent-worker-guard: Codex did not ask the user about this call, so it is not run. Do not repeat "
+                 "it. Tell the user: restart Codex after the guard's rule file is installed and check that its "
+                 "hook entries are trusted.",
+    "cut": "[{count} characters not shown]",
+    "reply_ask": "This call waits for the user's decision. Rule {id}: {why}. The user can allow exactly this call "
+                 "once: their own message that is just the code {code} does it. Ask them in plain text and end "
+                 "your turn: say what the call does and to what, and give this line unchanged: \"To allow it "
+                 "once, reply: {code}\". Do not use request_user_input for it. When their next message is the "
+                 "code, repeat the same call unchanged within {minutes} minutes: it passes once. Any other reply "
+                 "leaves the call refused. Do not reword the call, do not reach the same effect another way, and "
+                 "never send the code yourself. Call: {what}",
+    "reply_done": "agent-worker-guard: the user's reply allows one call. Rule {id}. The same call repeated "
+                  "unchanged within {minutes} minutes passes once. Call: {what}",
 }
 DEFAULT_MESSAGES = dict(MESSAGES)
 # codex subcommands that run a model or an agent runtime, or apply its changes to the tree.
@@ -82,7 +137,7 @@ CODEX_RUN = {"exec", "e", "review", "resume", "fork", "app-server", "exec-server
              "cloud-tasks", "agents", "remote-control", "queue", "apply", "a"}
 # Inspection and management; any other positional after `codex` is a prompt for the interactive agent.
 CODEX_SAFE = {"help", "login", "logout", "mcp", "plugin", "completion", "update", "doctor", "sandbox",
-              "debug", "archive", "delete", "unarchive", "migrate-rollouts", "features", "app"}
+              "debug", "archive", "delete", "unarchive", "migrate-rollouts", "features", "app", "execpolicy"}
 CODEX_VALUE_OPTS = {"-c", "--config", "--enable", "--disable", "--remote", "--remote-auth-token-env", "-m",
                     "--model", "-p", "--profile", "-s", "--sandbox", "-a", "--ask-for-approval", "-C", "--cd",
                     "-i", "--image", "--add-dir", "--local-provider"}
@@ -796,16 +851,48 @@ def edited(tool, data, path):
     return text, new
 
 
+def route_call(command, depth=0):
+    """True when the shell text starts the guard in a mode that writes or uses an approval (ROUTE_FLAGS): the guard
+    named before the flag, the same inside the script a shell is given, or both in one argument of an interpreter.
+    Reading about the guard (a viewer, a printer, a search that only names it) is not calling it."""
+    if "agent-worker-guard" not in command or not any(flag in command for flag in ROUTE_FLAGS):
+        return False
+    try:
+        called = [[str(w) for w in cmd["words"]] for cmd in parse(command)]
+    except Exception:  # not only a syntax the parser refuses: what cannot be read here is not run
+        return True
+    for words in called:
+        words = words[command_index(words):]
+        head = base(words[0]) if words else ""
+        if not words or head in VIEWERS | PRINTERS:
+            continue
+        at = next((k for k, w in enumerate(words) if base(w) == "agent-worker-guard"), None)
+        if at is not None and any(flag in words[at + 1:] for flag in ROUTE_FLAGS):
+            return True
+        inner = [w for w in words[1:] if "agent-worker-guard" in w and any(flag in w for flag in ROUTE_FLAGS)]
+        if head in INTERPRETERS and inner or head in SHELLS | {"eval"} and any(
+                depth > 2 or route_call(w, depth + 1) for w in inner):
+            return True
+    return False
+
+
 def protect(event):
     """Deny when a tool call would set an off switch or change the rules or the guard's settings (the rules and the
     settings: unless the user opened them)."""
     opened = fresh(DESTRUCTIVE_FLAG)
-    files = ["allow-direct-codex", "allow-destructive"] + ([] if opened else ["destructive-rules.json", LOCAL_RULES])
+    store_dir = base(APPROVALS)
+    files = ["allow-direct-codex", "allow-destructive"] + (
+        [] if opened else ["destructive-rules.json", LOCAL_RULES, PROMPT_RULES])
     tool, data = event.get("tool_name", ""), event.get("tool_input") or {}
     cwd = event.get("cwd") or os.getcwd()
+
+    def kept(path):
+        """The path leads into the approvals store: a directory of that very name, not a name that holds it."""
+        return store_dir in str(path).split("/")
+
     if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
         path = str(data.get("file_path") or data.get("notebook_path") or "")
-        if base(path) in files:
+        if base(path) in files or kept(path):
             return text("protect")
         full = os.path.join(cwd, os.path.expanduser(path))
         kind = None if opened or tool == "NotebookEdit" else settings_kind(full)
@@ -819,20 +906,26 @@ def protect(event):
         # to a file that registers the guard is not worked out: such a patch is the user's to make.
         patch = str(data.get("command") or data.get("input") or data.get("patch") or "")
         for path in re.findall(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): *(.+?) *$", patch, re.M):
-            if base(path) in files or not opened and settings_kind(os.path.join(cwd, os.path.expanduser(path))) == "user":
+            if base(path) in files or kept(path) or \
+                    not opened and settings_kind(os.path.join(cwd, os.path.expanduser(path))) == "user":
                 return text("protect")
         return None
     if tool in ("Bash", "mcp__terminal__run_in_terminal"):
         command = str(data.get("command") or "")
+        # The approvals are written by the guard when Codex calls it for its own events, and --confirm belongs
+        # to a line Codex asked the user about. An agent that runs the guard in one of these modes itself,
+        # directly or through an interpreter, would be answering for the user.
+        if route_call(command):
+            return text("confirm")
         switch_words = [] if opened else [*GUARD_ENV, "disableAllHooks"]
         settings = not opened and re.search(SETTINGS_NAME, command) is not None
-        if not settings and not any(name in command for name in files + switch_words):
+        if not settings and not any(name in command for name in files + [store_dir] + switch_words):
             return None
         switched = any(word in command for word in switch_words)
         try:
             commands = parse(command)
         except ValueError:
-            named = any(name in command for name in files + switch_words) or \
+            named = any(name in command for name in files + [store_dir] + switch_words) or \
                 settings and "user" in settings_named(command, cwd)
             return text("protect") if named else None
         values = {}
@@ -842,12 +935,15 @@ def protect(event):
 
         def own(word):
             """The word names one of the guard's files: an off switch, the rules, the user settings."""
-            return any(name in word for name in files) or settings and "user" in settings_named(word, cwd)
+            return any(name in word for name in files) or kept(word) or \
+                settings and "user" in settings_named(word, cwd)
 
         for cmd in commands:
             words = [spelled(w) for w in cmd["words"]]
             if words[:1] == ["cd"]:
                 cwd = os.path.realpath(os.path.join(cwd, home_path(words[1] if len(words) > 1 else "~")))
+                if kept(cwd):
+                    return text("protect")  # what the next commands write there carries no path to check
                 continue
             # `F=~/.claude/settings.json` and `for f in ...` only name a path; what later commands do with it counts.
             pairs = [re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", w, re.S) for w in words]
@@ -862,7 +958,7 @@ def protect(event):
             head = base(str(cmd["sub"])) if cmd.get("sub") else base(words[c]) if c < len(words) else ""
             targets = words[-1:] if head in COPIERS else words
             redirects = [spelled(t) for op, t in cmd["redir"] if ">" in op]
-            names_own = any(name in w for w in words for name in files) or settings and (
+            names_own = any(kept(w) or any(name in w for name in files) for w in words) or settings and (
                 any("user" in settings_named(w, cwd) for w in targets) or into_settings_dir(words[c + 1:], cwd))
             if any(own(t) for t in redirects) or (names_own and head not in VIEWERS | PRINTERS):
                 return text("protect")
@@ -925,13 +1021,15 @@ def configure(rules):
 
 
 def text(key, **fields):
-    """One of the guard's messages; a broken replacement from the rules falls back to the built-in one."""
+    """One of the guard's messages; a broken or blank replacement from the rules falls back to the built-in one."""
     values = {"why": MESSAGES["codex_why"], "use": MESSAGES["codex_use"], **fields}
     for template in (MESSAGES[key], DEFAULT_MESSAGES[key]):
         try:
-            return template.format(**values)
+            made = template.format(**values)
         except (KeyError, IndexError, ValueError, TypeError):
             continue
+        if made.strip():  # Codex takes a refusal without words for a broken hook and runs the call
+            return made
     return DEFAULT_MESSAGES[key]
 
 
@@ -1635,28 +1733,206 @@ def decide_destructive(event, env, rules_path=RULES_FILE, rules=None):
     # A query the guard could not read: the rules may refuse it with a way out instead of asking the user blind.
     if kind == UNKNOWN_SQL and rules.get("unknown_sql_decision") == "deny":
         decision, key = "deny", "unknown_sql"
-    # A harness whose hooks cannot ask (Codex) gets a refusal that says whose decision it is.
-    if event.get("permission_mode") in rules.get("deny_in_permission_modes", []) or \
-            not (event.get("harness") or {}).get("ask", True):
+    if event.get("permission_mode") in rules.get("deny_in_permission_modes", []):
+        decision = "deny"
+    elif not (event.get("harness") or {}).get("ask", True):
+        # A harness whose hooks cannot ask (Codex): a route to the user's decision when one is switched on, else a
+        # refusal that says whose decision it is. Whatever else the rules name as the decision is a refusal there:
+        # Codex takes an answer it does not know for a broken hook and runs the call.
+        routed = None
+        if decision == "ask":
+            try:
+                routed = approval_route(event, rules, rule)
+            except Exception:
+                pass  # a broken store must not open the call: the plain refusal stands
+        if routed:
+            return None if routed[0] == "pass" else routed
         decision = "deny"
     message = rules.get("ask_message" if decision == "ask" else "message", "")
     return decision, text(key, message=message, id=rule["id"], why=rule["why"], what=what)
 
 
-def normalize(event, harness=None):
+# --- approval under Codex ---
+
+def digest(*parts):
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def stored(name, ttl=STORE_TTL):
+    """A record of the approvals store; None when it is missing, unreadable or written longer ago than ttl."""
+    path = os.path.join(APPROVALS, name)
+    try:
+        if time.time() - os.stat(path).st_mtime > ttl:
+            return None
+        with open(path, encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def store(name, record):
+    """Writes a record for this user only and drops what the store has kept for a day."""
+    os.makedirs(APPROVALS, mode=0o700, exist_ok=True)
+    for entry in os.scandir(APPROVALS):
+        try:
+            if time.time() - entry.stat().st_mtime > STORE_TTL:
+                os.unlink(entry.path)
+        except OSError:
+            pass
+    path, new = os.path.join(APPROVALS, name), os.path.join(APPROVALS, f"{name}.{os.getpid()}.new")
+    with os.fdopen(os.open(new, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False)
+    os.replace(new, path)
+
+
+def drop(name):
+    """True when this call removed the record: who removes it is the one that may use it."""
+    try:
+        os.unlink(os.path.join(APPROVALS, name))
+        return True
+    except OSError:
+        return False
+
+
+def guard_path():
+    """The guard as its hook entry names it: the first word of a rewritten command and of the exec-policy rule."""
+    return os.path.abspath(sys.argv[0])
+
+
+def confirm_line(rule_id, token, command):
+    """The line a shell call is rewritten to. The command is one single-quoted word, so the line stays two plain
+    commands for Codex's exec-policy parser whatever the command holds."""
+    quoted = "'" + command.replace("'", "'\"'\"'") + "'"
+    return f"{guard_path()} --confirm {rule_id} {token} && eval {quoted}"
+
+
+def confirm_words(command):
+    """(token, command) of a line that is exactly what confirm_line writes, else None."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    if len(words) == 7 and re.fullmatch(r"[0-9a-f]{12}", words[3]) and \
+            command == confirm_line(words[2], words[3], words[6]):
+        return words[3], words[6]
+    return None
+
+
+def note_asked(event):
+    """Route A, PermissionRequest: Codex is about to ask the user or its reviewer about a wrapper command."""
+    if event.get("tool_name") == "Bash":
+        found = confirm_words(str((event.get("tool_input") or {}).get("command") or ""))
+        if found:
+            store(found[0] + ".asked", {"command": digest(found[1])})
+
+
+def confirm(rule_id, token):
+    """Route A, the first command of a rewritten line: succeeds when Codex asked about the line with this token,
+    and the shell then runs the command after `&&`. The note is removed when it can be (a sandbox may forbid
+    it, and Codex asks again before it runs the line without the sandbox); either way the same line reaches
+    this check again only through Codex's rule, that is through another question. A note counts for ASKED_TTL:
+    a question nobody answered is not a standing permission."""
+    if not re.fullmatch(r"[0-9a-f]{12}", token) or not stored(token + ".asked", ASKED_TTL):
+        print(text("not_asked"), file=sys.stderr)
+        return CONFIRM_REFUSED
+    drop(token + ".asked")
+    return 0
+
+
+def requests(event):
+    """(code, record) of the route B requests of this session."""
+    session = str(event.get("session_id") or "")
+    try:
+        names = sorted(name for name in os.listdir(APPROVALS) if re.fullmatch(r"[0-9]{4}\.json", name))
+    except OSError:
+        return []
+    return [(name[:-5], record) for name in names for record in [stored(name)]
+            if record and session and record.get("session") == session]
+
+
+def shown(tool, data):
+    """The call in one line for the person who decides; a long one keeps its start and its end."""
+    call = " ".join((str(data.get("command") or "") if tool == "Bash" else
+                     f"{tool} {json.dumps(data, ensure_ascii=False, sort_keys=True)}").split())
+    if len(call) > SHOWN_CALL:
+        head, tail = SHOWN_CALL * 3 // 4, SHOWN_CALL // 4
+        call = f"{call[:head]} ... {text('cut', count=len(call) - head - tail)} ... {call[-tail:]}"
+    return call
+
+
+def approval_route(event, rules, rule):
+    """What a harness without "ask" does with a call that needs the user: ("rewrite", input) sends a shell call
+    to Codex's own approval prompt, ("pass",) lets through a call the user has just allowed once, ("deny", text)
+    tells the model how to ask them; None when no route is switched on."""
+    harness, tool, data = event.get("harness") or {}, event.get("tool_name", ""), event.get("tool_input") or {}
+    if tool == "Bash" and harness.get("prompt") and PLAIN_WORD.fullmatch(guard_path()) and \
+            event.get("permission_mode") in ("default", "acceptEdits", "plan"):
+        rule_id = str(rule["id"]) if PLAIN_WORD.fullmatch(str(rule["id"])) else "rule"
+        return "rewrite", {"command": confirm_line(rule_id, os.urandom(6).hex(), str(data.get("command") or ""))}
+    session = str(event.get("session_id") or "")
+    if not harness.get("reply") or not session:
+        return None
+    key, code, record = digest(tool, data, event.get("cwd")), None, None
+    for name, found in requests(event):
+        if found.get("key") != key:
+            continue
+        if found.get("state") != "approved":
+            code, record = code or name, record or found
+        elif found.get("until", 0) > time.time():
+            if drop(name + ".json"):
+                return ("pass",)
+        else:
+            drop(name + ".json")  # an approval that ran out must not stand in the way of the next one
+    if not record:
+        for _ in range(64):
+            code = f"{int.from_bytes(os.urandom(2), 'big') % 10000:04d}"
+            if not os.path.lexists(os.path.join(APPROVALS, code + ".json")):
+                break
+        else:
+            return None  # a store this full is not the guard's to add to: the plain refusal stands
+        record = {"key": key, "session": session, "state": "pending", "rule": str(rule["id"]),
+                  "what": shown(tool, data)}
+        store(code + ".json", record)
+    return "deny", text("reply_ask", id=rule["id"], why=rule["why"], what=record.get("what", ""), code=code,
+                        minutes=APPROVAL_TTL // 60)
+
+
+def note_reply(event):
+    """Route B, UserPromptSubmit: a message of the user that is just the code of a request of this session allows
+    that call once. Returns the words for the user and the model, None for any other message. The prompt of a
+    spawned agent is written by a model and never counts."""
+    said = str(event.get("prompt") or "").rsplit(IDE_REQUEST, 1)[-1]
+    found, session = REPLY.fullmatch(said), str(event.get("session_id") or "")
+    if not found or not session or event.get("agent_id") or event.get("agent_type"):
+        return None
+    name = found.group(1) + ".json"
+    record = stored(name)
+    if not record or record.get("state") != "pending" or record.get("session") != session:
+        return None
+    store(name, dict(record, state="approved", until=time.time() + APPROVAL_TTL))
+    return text("reply_done", id=record.get("rule", ""), what=record.get("what", ""), minutes=APPROVAL_TTL // 60)
+
+
+def normalize(event, harness=None, routes=()):
     """The hook event with "harness": what the calling harness can honor. It is the one named on the command line,
     else Codex when the event carries its turn_id, else Claude Code. Both send the shell tool as "Bash" with the
     command in one string and MCP tools as mcp__server__tool, so the event itself needs no rewriting; a harness
-    that names things differently gets its translation here."""
+    that names things differently gets its translation here. routes: the approval routes switched on for a
+    harness that cannot ask ("prompt", "reply")."""
     event = dict(event) if isinstance(event, dict) else {}
     name = harness or ("codex" if "turn_id" in event else "claude")
-    event["harness"] = dict(HARNESSES.get(name, {"ask": False}), name=name)
+    event["harness"] = dict(HARNESSES.get(name, {"ask": False}), name=name, **{route: True for route in routes})
     return event
 
 
 def respond(decision, reason):
     if decision == "warn":
         json.dump({"systemMessage": reason}, sys.stdout, ensure_ascii=False)
+    elif decision == "rewrite":
+        # Codex takes a changed input only together with "allow"; nothing else may be in the answer.
+        json.dump({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                          "updatedInput": reason}}, sys.stdout, ensure_ascii=False)
     else:
         json.dump({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
                                           "permissionDecisionReason": reason}}, sys.stdout, ensure_ascii=False)
@@ -1666,6 +1942,7 @@ def respond(decision, reason):
 
 CODEX_CASES = [
     ("Bash", "codex exec 'fix it'", True),
+    ("Bash", "codex execpolicy check --rules ~/.codex/rules/default.rules -- git status", False),
     ("Bash", "cd /x && codex exec --sandbox read-only -C . -", True),
     ("Bash", "codex -c model=o3 e hi", True),
     ("Bash", "CODEX_HOME=/tmp/x /opt/homebrew/bin/codex review", True),
@@ -1745,6 +2022,40 @@ PROTECT_CASES = [
     ("Bash", "jq '.bash = []' x > ~/.config/agent-worker-router/destructive-rules.local.json", True),
     ("Bash", "cat ~/.config/agent-worker-router/destructive-rules.local.json", False),
     ("Bash", "[[ ${#x} -gt 0 ]] && touch ~/.config/agent-worker-router/allow-destructive", True),
+    # The approvals of the Codex routes and the rule file of the native prompt are the guard's own as well.
+    ("Bash", "touch ~/.config/agent-worker-router/guard-approvals/0123456789ab.asked", True),
+    ("Bash", "echo '{}' > ~/.config/agent-worker-router/guard-approvals/a.json", True),
+    ("Bash", "rm -r ~/.config/agent-worker-router/guard-approvals", True),
+    ("Bash", "ls -la ~/.config/agent-worker-router/guard-approvals", False),
+    ("Write", {"file_path": "/Users/u/.config/agent-worker-router/guard-approvals/a.json", "content": "{}"}, True),
+    ("apply_patch", {"command": "*** Begin Patch\n*** Add File: /Users/u/.config/agent-worker-router/guard-approvals/"
+                                "a.json\n+{}\n*** End Patch"}, True),
+    ("Bash", "rm ~/.codex/rules/agent-worker-guard.rules", True),
+    ("Write", {"file_path": "/Users/u/.codex/rules/agent-worker-guard.rules", "content": ""}, True),
+    ("Bash", "cat ~/.codex/rules/agent-worker-guard.rules", False),
+    # The wrapper of the native prompt is Codex's to run; reading about it is not calling it.
+    ("Bash", "~/.local/bin/agent-worker-guard --confirm rm-recursive 0123456789ab && eval 'rm -rf /x'", True),
+    ("Bash", "cd /tmp && env A=1 agent-worker-guard --confirm r 0123456789ab", True),
+    # An event fed to the guard by hand would write an approval the user never gave.
+    ("Bash", "~/.local/bin/agent-worker-guard --destructive --harness codex --reply < /tmp/event.json", True),
+    ("Bash", "cat e.json | /usr/bin/python3 -IS ~/.local/bin/agent-worker-guard --harness codex --native-prompt", True),
+    ("Bash", "~/.local/bin/agent-worker-guard --all < /tmp/event.json", False),
+    ("Bash", "~/.local/bin/agent-worker-guard --selftest", False),
+    ("Bash", "grep -n -- --confirm ~/.local/bin/agent-worker-guard", False),
+    ("Bash", "echo agent-worker-guard --confirm is the check", False),
+    ("Bash", "git commit -m 'agent-worker-guard: --reply route'", False),
+    ("Bash", "git grep -e --confirm -- agent-worker-guard", False),
+    # The same through a shell or an interpreter; a shell that only reads is still reading.
+    ("Bash", "bash -c '~/.local/bin/agent-worker-guard --confirm r 0123456789ab'", True),
+    ("Bash", "python3 -c \"import os; os.system('agent-worker-guard --reply < e.json')\"", True),
+    ("Bash", "bash -lc \"grep -n -- --confirm ~/.local/bin/agent-worker-guard\"", False),
+    # A command the parser cannot read is not run in one of these modes either.
+    ("Bash", "~/.local/bin/agent-worker-guard --confirm r 0123456789ab 'not closed", True),
+    # The store is a directory of that very name; inside it a write needs no path.
+    ("Bash", "cd ~/.config/agent-worker-router/guard-approvals && touch 0123456789ab.asked", True),
+    ("Bash", "git add docs/guard-approvals.md", False),
+    ("Bash", "mkdir guard-approvals-x", False),
+    ("Write", {"file_path": "/Users/u/docs/guard-approvals.md", "content": "notes"}, False),
 ]
 
 # The guard's own settings. {SET} is a user settings file with the guard's hook entry, {CFG} its directory, {D} the
@@ -2294,7 +2605,7 @@ GIT_PUSH_CASES = [
 
 
 def selftest(rules_path=RULES_FILE):
-    global SETTINGS, DESTRUCTIVE_FLAG, CODEX_HOOKS
+    global SETTINGS, DESTRUCTIVE_FLAG, CODEX_HOOKS, APPROVALS
     import tempfile
     failures, total = [], 0
     # The rules (and their local addition with its own cases) also decide what counts as a launcher.
@@ -2478,6 +2789,186 @@ def selftest(rules_path=RULES_FILE):
                                  decide_destructive(normalize(event, "other"), {}, plain_rules))] \
                 != ["ask", "ask", "deny", "deny", "deny"]:
             failures.append("harness: ask under Claude Code, a refusal under Codex and under a harness not listed")
+        # Approval under Codex. The store of the test is the one a guard started with this home would use, so the
+        # wrapper, run as a process of its own, reads what the hook functions wrote.
+        home = os.path.join(d, "home")
+        saved_store, APPROVALS = APPROVALS, os.path.join(home, ".config", "agent-worker-router", "guard-approvals")
+        # The guard of these cases is the copy in the test directory: a path Codex reads as a plain word.
+        saved_argv, sys.argv[0] = sys.argv[0], os.path.join(d, "guard-copy")
+        try:
+            def codex(tool, data, mode, routes, session="s1"):
+                return normalize({"tool_name": tool, "tool_input": data, "cwd": d, "session_id": session,
+                                  "permission_mode": mode, "turn_id": "t"}, "codex", routes)
+
+            def shell(line):
+                return subprocess.run(["/bin/sh", "-c", line], env={"HOME": home, "PATH": os.defpath},
+                                      capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+            os.chmod(sys.argv[0], 0o755)
+            # Route A: a shell call becomes `guard --confirm RULE TOKEN && eval 'command'` where Codex can ask,
+            # the command in one word whatever it holds; Codex's request is noted; --confirm succeeds once and
+            # only with that note, so without it the shell never reaches the command.
+            wipe = f"rm -rf {outside_dir}/x; echo 'it'\"'\"'s' \"$HOME\" $(date)\n# done"
+            total += 1
+            got = decide_destructive(codex("Bash", {"command": wipe}, "default", ["prompt", "reply"]), {}, plain_rules)
+            line = got[1]["command"] if got and got[0] == "rewrite" else ""
+            if not got or got[0] != "rewrite" or (confirm_words(line) or ("", ""))[1] != wipe or \
+                    not re.fullmatch(re.escape(sys.argv[0]) + r" --confirm rm-recursive [0-9a-f]{12} && eval '.*'", line, re.S):
+                failures.append(f"route A: a shell call must become the confirm line holding the command, got {got}")
+            total += 1
+            sys.argv[0] = os.path.join(d, "with space", "guard-copy")
+            spaced = decide_destructive(codex("Bash", {"command": wipe}, "default", ["prompt"]), {}, plain_rules)
+            sys.argv[0] = os.path.join(d, "guard-copy")
+            if not spaced or spaced[0] != "deny":
+                failures.append("route A: a guard path that Codex would not read as a plain word must not be rewritten to")
+            total += 1
+            if [v and v[0] for v in (
+                    decide_destructive(codex("Bash", {"command": wipe}, "bypassPermissions", ["prompt"]), {}, plain_rules),
+                    decide_destructive(codex("Bash", {"command": wipe}, None, ["prompt"]), {}, plain_rules),
+                    decide_destructive(codex("Bash", {"command": wipe}, "default", []), {}, plain_rules),
+                    decide_destructive(codex("mcp__clickhouse__run_query", {"query": "DROP TABLE t"}, "default",
+                                             ["prompt"]), {}, plain_rules))] != ["deny"] * 4:
+                failures.append("route A: no rewrite when Codex cannot ask, without the flag, or for a tool that is not the shell")
+            total += 1
+            ran = confirm_line("test-rule", "0123456789ab", "echo ran; echo \"it's $0\" >/dev/null")
+            before = shell(ran)
+            for command in (ran + " && echo more", ran.replace("--confirm", "--other"), "echo ran", " " + ran,
+                            ran.replace(guard_path(), "/bin/echo"), ran.replace("&& eval", "; eval"),
+                            ran.replace("&& eval", "|| eval"), ran.replace("0123456789ab", "0123456789AB")):
+                note_asked({"tool_name": "Bash", "tool_input": {"command": command}})
+            unnoted = shell(ran)
+            note_asked({"tool_name": "Write", "tool_input": {"command": ran}})
+            wrong_tool = shell(ran)
+            note_asked({"tool_name": "Bash", "tool_input": {"command": ran}})
+            other = shell(confirm_line("test-rule", "ba9876543210", "echo ran"))
+            once = shell(ran)
+            twice = shell(ran)
+            if [(run.returncode, run.stdout) for run in (before, unnoted, wrong_tool, other, once, twice)] != \
+                    [(CONFIRM_REFUSED, "")] * 4 + [(0, "ran\n"), (CONFIRM_REFUSED, "")]:
+                runs = (before, unnoted, wrong_tool, other, once, twice)
+                failures.append("route A: the command runs once, only after Codex asked about that very line: "
+                                f"{[(run.returncode, run.stdout, run.stderr[:80]) for run in runs]}")
+            # A note counts for a while: a question nobody answered is not a standing permission.
+            total += 1
+            note_asked({"tool_name": "Bash", "tool_input": {"command": ran}})
+            aged = time.time() - ASKED_TTL - 5
+            os.utime(os.path.join(APPROVALS, "0123456789ab.asked"), (aged, aged))
+            stale = shell(ran)
+            drop("0123456789ab.asked")
+            if (stale.returncode, stale.stdout) != (CONFIRM_REFUSED, ""):
+                failures.append(f"route A: a note older than the guard keeps must not confirm, got {stale.returncode}")
+            # Route B: a refusal that names a code; the user's own message that is just that code allows the same
+            # call, once, in the session that asked, for a while.
+            push, both = {"command": "git push --force origin main"}, ["prompt", "reply"]
+
+            def refused(session="s1", data=push, tool="Bash"):
+                got = decide_destructive(codex(tool, data, "bypassPermissions", both, session), {}, plain_rules)
+                names = sorted(n for n in os.listdir(APPROVALS) if n.endswith(".json")) if os.path.isdir(APPROVALS) else []
+                return got, names
+
+            def says(prompt, session="s1", **more):
+                return note_reply(dict({"hook_event_name": "UserPromptSubmit", "prompt": prompt,
+                                        "session_id": session}, **more))
+
+            def clear():
+                for name in os.listdir(APPROVALS):
+                    drop(name)
+
+            total += 1
+            got, names = refused()
+            again, names_again = refused()
+            code = names[0][:-5] if len(names) == 1 else ""
+            if not got or got[0] != "deny" or not re.fullmatch(r"[0-9]{4}", code) or code not in got[1] \
+                    or "git push --force origin main" not in got[1] or names != names_again or again != got \
+                    or (stored(code + ".json") or {}).get("state") != "pending":
+                failures.append(f"route B: a refusal names one code and keeps it for the same call, got {got} {names}")
+            total += 1
+            silent = [says(f"no {code}"), says(f"{code} and the rest"), says("%04d" % ((int(code or 0) + 1) % 10000)),
+                      says(code + "1"), says(""), says(code, session="s2"), says(code, session=""),
+                      says(code, agent_id="a1"), says(code, agent_type="worker"),
+                      says(f"> To allow it once, reply:\n> {code}")]
+            if any(silent) or (stored(code + ".json") or {}).get("state") != "pending" or refused()[0] is None:
+                failures.append("route B: only the user's own message that is just the code, in the session that "
+                                f"asked, counts: {silent}")
+            total += 1
+            results = []
+            for form in ("{}", " {}\n", "`{}`", "да {}", "OK, {}.", "guard {}", "Код: {}",
+                         "# Context from my IDE setup:\n\n## Active file: a.py\n\n" + IDE_REQUEST + "\n{}"):
+                clear()
+                code = refused()[1][0][:-5]
+                done = says(form.format(code))
+                first, second = refused()[0], refused()[0]
+                results.append(bool(done) and "git push --force origin main" in done and first is None
+                               and bool(second) and second[0] == "deny")
+            if not all(results):
+                failures.append(f"route B: the user's code allows the same call once, however they wrap it: {results}")
+            total += 1
+            clear()
+            code = refused()[1][0][:-5]
+            says(code)
+            elsewhere = refused(session="s2")[0]
+            different = refused(data={"command": "git push --force origin main "})[0]
+            approved = stored(code + ".json") or {}
+            store(code + ".json", dict(approved, until=time.time() - 1))
+            late, names = refused()
+            next_code = next((n[:-5] for n in names for r in [stored(n) or {}] if r.get("state") == "pending"
+                              and r.get("session") == "s1" and r.get("key") == approved.get("key")), "")
+            if not (elsewhere and different and late) or approved.get("state") != "approved" or not next_code \
+                    or not says(next_code) or refused()[0] is not None:
+                failures.append("route B: an approval is for the same call, the same session and a few minutes, and "
+                                "one that ran out does not stand in the way of the next")
+            # A long call keeps its start and its end, and says how much it leaves out.
+            total += 1
+            clear()
+            long_call = "git push --force origin main " + "x" * 3000 + " the-end"
+            got = refused(data={"command": long_call})[0]
+            left_out = text("cut", count=len(long_call) - SHOWN_CALL * 3 // 4 - SHOWN_CALL // 4)
+            if not got or "the-end" not in got[1] or left_out not in got[1] or "x" * (SHOWN_CALL + 1) in got[1]:
+                failures.append(f"route B: a long call is shown by its start and its end, got {str(got)[:200]}")
+            # The routes together: the shell goes to Codex's own prompt where it can ask, anything else to the code.
+            total += 1
+            if [v and v[0] for v in (
+                    decide_destructive(codex("Bash", push, "default", both), {}, plain_rules),
+                    decide_destructive(codex("Bash", push, "bypassPermissions", both), {}, plain_rules),
+                    decide_destructive(codex("mcp__clickhouse__run_query", {"query": "DROP TABLE t"}, "default",
+                                             both), {}, plain_rules),
+                    decide_destructive(codex("Bash", {"command": "ls"}, "default", both), {}, plain_rules))] \
+                    != ["rewrite", "deny", "deny", None]:
+                failures.append("routes: the native prompt for the shell where Codex can ask, the code otherwise")
+            # Whatever the rules name as the decision, a harness that cannot ask refuses; Claude Code asks with the
+            # routes switched on as it does without them.
+            total += 1
+            loaded = load_rules(plain_rules)
+            odd = [decide_destructive(codex("Bash", push, "bypassPermissions", both), {},
+                                      rules=dict(loaded, decision=value)) for value in ("allow", "Ask", "deny")]
+            asks = decide_destructive(normalize({"tool_name": "Bash", "tool_input": push, "cwd": d}, "claude", both),
+                                      {}, plain_rules)
+            if [v and v[0] for v in odd] != ["deny"] * 3 or not asks or asks[0] != "ask":
+                failures.append(f"routes: an odd decision in the rules is a refusal under Codex, and Claude Code asks: {odd} {asks}")
+            # A refusal without words would be no refusal to Codex.
+            total += 1
+            saved_text, MESSAGES["protect"] = MESSAGES["protect"], "  "
+            blank = text("protect")
+            MESSAGES["protect"] = saved_text
+            if blank != DEFAULT_MESSAGES["protect"]:
+                failures.append("messages: a blank replacement must fall back to the built-in text")
+            # No session, or a store that cannot be written, leaves the plain refusal, never an open call.
+            total += 1
+            plain = decide_destructive(codex("Bash", push, "bypassPermissions", []), {}, plain_rules)
+            nameless = decide_destructive(codex("Bash", push, "bypassPermissions", both, session=""), {}, plain_rules)
+            clear()
+            os.rmdir(APPROVALS)
+            with open(APPROVALS, "w") as f:
+                f.write("not a directory")
+            broken = decide_destructive(codex("Bash", push, "bypassPermissions", ["reply"]), {}, plain_rules)
+            os.unlink(APPROVALS)
+            if not plain or plain[0] != "deny" or nameless != plain or broken != plain:
+                failures.append(f"routes: no session or a broken store must leave the plain refusal, got {nameless} {broken}")
+        except Exception as error:  # a broken route must show as a failed case, not end the run
+            total += 1
+            failures.append(f"approval routes: {type(error).__name__}: {error}")
+        finally:
+            APPROVALS, sys.argv[0] = saved_store, saved_argv
         for tool, data, destructive, rules_file in \
                 [(*case, plain_rules) for case in MCP_CASES] + [(*case, test_rules) for case in local.get("mcp", [])] + [
                     ("mcp__clickhouse__run_query", {"query": "INSERT INTO t VALUES (1)"}, False, narrow_rules),
@@ -2558,18 +3049,41 @@ def main():
     args = sys.argv[1:]
     if args[:1] == ["--selftest"]:
         return selftest(*args[1:2])
+    if args[:1] == ["--confirm"]:
+        try:
+            configure(load_rules())
+        except (OSError, ValueError):
+            pass
+        return confirm(*args[1:]) if len(args) == 3 else 2
     harness = None
     if "--harness" in args:
         k = args.index("--harness")
         harness = (args[k + 1:k + 2] or [None])[0]
         del args[k:k + 2]
+    routes = [route for route, flag in (("prompt", "--native-prompt"), ("reply", "--reply")) if flag in args]
+    # --question: the flag of a route that is gone; an entry that still carries it keeps its policy.
+    args = [arg for arg in args if arg not in ("--native-prompt", "--reply", "--question")]
     try:
-        event = normalize(json.load(sys.stdin), harness)
+        event = normalize(json.load(sys.stdin), harness, routes)
         try:
             rules = load_rules()
             configure(rules)
         except (OSError, ValueError):
             rules = None  # the destructive policy says so to the user
+        # One command line serves every event of a harness that names them; the routes own two of them.
+        happened = event.get("hook_event_name") or "PreToolUse"
+        if happened == "PermissionRequest":
+            if event["harness"].get("prompt"):
+                note_asked(event)
+            return 0
+        if happened == "UserPromptSubmit":
+            said = note_reply(event) if event["harness"].get("reply") else None
+            if said:
+                json.dump({"systemMessage": said, "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit", "additionalContext": said}}, sys.stdout, ensure_ascii=False)
+            return 0
+        if happened != "PreToolUse":
+            return 0
         reason = protect(event)
         if reason:
             respond("deny", reason)

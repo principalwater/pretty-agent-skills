@@ -15,7 +15,8 @@ run_worker() {
   perl -e '
     use strict;
     use warnings;
-    my ($file, $wait, $timeout, $started) = splice @ARGV, 0, 4;
+    use POSIX qw(setpgid);
+    my ($file, $wait, $timeout, $started, $worker) = splice @ARGV, 0, 5;
     my $lease;
     if (length $file) {
       open $lease, ">>", $file or do { warn "lease $file: $!\n"; exit 78 };
@@ -29,15 +30,34 @@ run_worker() {
     defined $pid or do { warn "fork: $!\n"; exit 78 };
     if (!$pid) {
       $SIG{ALRM} = "DEFAULT";
-      alarm $timeout;
+      if ($worker eq "grok") { setpgid(0, 0) == 0 or die "setpgid: $!\n" }
+      else { alarm $timeout }
       # Perl closes the lease fd on exec so worker daemons cannot retain it.
       exec @ARGV or die "exec: $!\n";
     }
     print $receipt "1\n";
     close $receipt;
+    if ($worker eq "grok") {
+      # Grok can exec bubblewrap, which forks the actual worker. Hold the lease through group cleanup.
+      setpgid($pid, $pid);
+      my $stop = sub {
+        my $code = shift;
+        $SIG{$_} = "IGNORE" for qw(ALRM TERM INT HUP);
+        kill "TERM", -$pid;
+        select undef, undef, undef, 2;
+        kill "KILL", -$pid;
+        waitpid $pid, 0;
+        exit $code;
+      };
+      $SIG{ALRM} = sub { $stop->(142) };
+      $SIG{TERM} = sub { $stop->(143) };
+      $SIG{INT} = sub { $stop->(130) };
+      $SIG{HUP} = sub { $stop->(129) };
+      alarm $timeout;
+    }
     waitpid $pid, 0;
     exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
-  ' "$lease" "$lease_wait" "$1" "$launch_file" "${@:2}"
+  ' "$lease" "$lease_wait" "$1" "$launch_file" "$worker" "${@:2}"
 }
 
 worker= dir= model= effort= provider= evidence= timeout=300 access=read pro=0 keep=0 resume= via=

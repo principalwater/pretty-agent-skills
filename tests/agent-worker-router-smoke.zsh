@@ -145,7 +145,9 @@ idx=${argv[(i)--prompt-file]}
 (( idx < $# )) || exit 1
 cat -- "${argv[idx+1]}" > "$HOME/brief"
 print -r -- "${argv[idx+1]}" > "$HOME/grok-prompt-path"
-[[ ! -f $HOME/grok-timeout ]] || exec perl -e 'sleep 10'
+if [[ -f $HOME/grok-timeout ]]; then
+  exec perl -e 'open my $f, ">>", shift or die $!; flock $f, 2 or die $!; if (fork == 0) { $SIG{TERM} = "IGNORE"; sleep 10; exit } sleep 10' "$HOME/grok-child-lock"
+fi
 cat "$HOME/grok-result"
 FAKE
 chmod 700 "$tmp/bin/grok"
@@ -166,6 +168,7 @@ touch "$HOME/grok-timeout"
 rc=0; "$router" --worker grok -C "$tmp/work" --timeout 1 test > "$tmp/stdout" 2> "$tmp/stderr" || rc=$?
 [[ $rc == 124 && ! -e $(< "$HOME/grok-prompt-path") ]] || fail 'Grok timeout or prompt cleanup failed'
 receipt '.exit == 124'
+perl -e 'open my $f, ">>", shift or die $!; exit !flock($f, 2|4)' "$HOME/grok-child-lock" || fail 'Grok child survived the timeout'
 rm "$HOME/grok-timeout"
 for response in '{"text":"OK","stopReason":"max_tokens"}'  '{"text":"OK","stopReason":"hook_blocked"}' '{}'; do
   print -r -- "$response" > "$HOME/grok-result"

@@ -11,7 +11,7 @@ Current skills:
 
 ## Agent worker router (Codex and Claude Code)
 
-`plugins/agent-worker-router` runs a **fresh external** DeepSeek, Claude Code, or Codex worker without changing the host's default model. It is not a native subagent. Access is explicit per call: `read` (default), `edit`, or `full`; `full` requires a separate local opt-in and exposes same-user files and Keychain. `-C` is a starting directory, **not** a privacy boundary for Codex at any access level or for any full-access worker. Codex read-only restricts writes, not reads. Never route secrets or private data across providers without reviewing what the worker can read.
+`plugins/agent-worker-router` runs a **fresh external** DeepSeek, Claude Code, Codex, or Grok Build worker without changing the host's default model. It is not a native subagent. Access is explicit per call: `read` (default), `edit`, or `full`; `full` requires a separate local opt-in and exposes same-user files and Keychain. `-C` is a starting directory, **not** a privacy boundary for Codex at any access level or for any full-access worker. Codex read-only restricts writes, not reads. Never route secrets or private data across providers without reviewing what the worker can read.
 
 Requires macOS, `zsh`, `jq`, and the relevant agent CLI. DeepSeek additionally needs the user's own API key in the login Keychain. Install or update through the host marketplace:
 
@@ -28,6 +28,8 @@ Locate the installed `agent-worker-router` skill and run its adjacent `scripts/s
 "/absolute/installed/path/skills/agent-worker-router/scripts/agent-worker-router" \
   --worker deepseek --access read -C /reviewed/dir 'A bounded task'
 ```
+
+For a Grok Build review, install the official CLI, run `grok login`, then select `--worker grok -C DIR --access read`. It supports `--model` and `--effort`, uses the CLI’s minimal sandbox and starts a fresh session for each call. [Grok Build CLI](https://docs.x.ai/build/overview)
 
 `--worker claude` uses your Claude Code account; `--worker codex` uses your Codex account. When the official Claude Code plugin `openai/codex-plugin-cc` is installed and enabled, `--worker codex` runs through that plugin's runtime with your MCP servers, plugins, hooks and apps switched off, and otherwise through `codex exec`; `--resume ID`, `--access full`, a `-C` below its Git root, a `.codex` project layer in `-C`, execpolicy rules in `$CODEX_HOME/rules` and an MCP server that `codex mcp list` still reports enabled always use `codex exec`, and `--via plugin|cli` pins the route. On both routes read and edit workers run without execpolicy rules, plugins, hooks, apps, notify, web search and sub-agents, without login shells or your zsh dotfiles, and with only the router's environment; edit writes only to `-C` and a private `TMPDIR` (no `/tmp`, no configured `writable_roots`). Commands listed as `worker_deny_commands` in `~/.config/agent-worker-router/destructive-rules.json` are refused inside worker shells. The receipt's `path` names the route that ran. Keep the native `codex:codex-rescue` agent for in-session work that needs your full Codex configuration: request read-only explicitly (it can write), and note that its shared broker keeps app-server and MCP processes alive after the call. From Codex, Claude and DeepSeek use the router CLI; DeepSeek never uses a native `deepseek-worker` subagent. The Claude worker needs network and macOS Keychain access from the calling Codex session.
 

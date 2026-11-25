@@ -133,6 +133,53 @@ print '{"result":"OK","modelUsage":{"claude-test":{}},"is_error":false,"session_
 
 "$router" --help > "$tmp/help"
 grep -q 'deepseek|claude|codex' "$tmp/help" || fail help
+cat > "$tmp/bin/grok" <<'FAKE'
+#!/bin/zsh
+set -eu
+if [[ ${argv[-2]} == inspect && ${argv[-1]} == --json ]]; then
+  cat "$HOME/grok-inspect"
+  exit 0
+fi
+print -rl -- "$@" > "$HOME/argv"
+idx=${argv[(i)--prompt-file]}
+(( idx < $# )) || exit 1
+cat -- "${argv[idx+1]}" > "$HOME/brief"
+print -r -- "${argv[idx+1]}" > "$HOME/grok-prompt-path"
+[[ ! -f $HOME/grok-timeout ]] || exec perl -e 'sleep 10'
+cat "$HOME/grok-result"
+FAKE
+chmod 700 "$tmp/bin/grok"
+print '{"hooks":[],"mcpServers":[],"plugins":[],"lspServers":[]}' > "$HOME/grok-inspect"
+print '{"text":"OK","stopReason":"end_turn","sessionId":"grok-test","usage":{"input_tokens":3,"output_tokens":1},"modelUsage":{"grok-test":{}}}' > "$HOME/grok-result"
+run --worker grok -C "$tmp/work" --model grok-test --effort high 'private review brief'
+[[ $(< "$HOME/brief") == 'private review brief' ]] || fail 'Grok brief missing from prompt file'
+[[ ! -e $(< "$HOME/grok-prompt-path") ]] || fail 'Grok prompt left behind'
+! grep -Fq 'private review brief' "$HOME/argv" || fail 'Grok brief in argv'
+grep -Fxq 'minimal' "$HOME/argv" && grep -Fxq 'read_file,grep,list_dir' "$HOME/argv" || fail 'missing Grok read restrictions'
+receipt '.worker == "grok" and .model == "grok-test" and .effort == "unverified" and .session == "grok-test" and .kept and .tokens == {input:3,output:1}'
+mkdir -p "$HOME/.grok/bin"
+mv "$tmp/bin/grok" "$HOME/.grok/bin/grok"
+run --worker grok -C "$tmp/work" test
+for mode in edit full; do reject 2 --worker grok -C "$tmp/work" --access "$mode" test; done
+for arg in --pro --keep; do reject 2 --worker grok -C "$tmp/work" "$arg" test; done
+touch "$HOME/grok-timeout"
+rc=0; "$router" --worker grok -C "$tmp/work" --timeout 1 test > "$tmp/stdout" 2> "$tmp/stderr" || rc=$?
+[[ $rc == 124 && ! -e $(< "$HOME/grok-prompt-path") ]] || fail 'Grok timeout or prompt cleanup failed'
+receipt '.exit == 124'
+rm "$HOME/grok-timeout"
+for response in '{"text":"OK","stopReason":"max_tokens"}'  '{"text":"OK","stopReason":"hook_blocked"}' '{}'; do
+  print -r -- "$response" > "$HOME/grok-result"
+  rc=0; "$router" --worker grok -C "$tmp/work" test > "$tmp/stdout" 2> "$tmp/stderr" || rc=$?
+  [[ $rc == 1 && ! -s $tmp/stdout ]] || fail 'incomplete Grok response accepted'
+  receipt '.exit == 1'
+done
+print '{"hooks":[{"event":"Stop"}],"plugins":[],"mcpServers":[],"hookLoadErrors":[],"lspServers":[]}' > "$HOME/grok-inspect"
+rm "$HOME/brief"
+rc=0; "$router" --worker grok -C "$tmp/work" test > "$tmp/stdout" 2> "$tmp/stderr" || rc=$?
+[[ $rc == 1 ]] || fail 'unsafe Grok config accepted'
+receipt '.exit == 1'
+[[ ! -f $HOME/brief ]] || fail 'Grok ran with a configured hook'
+
 reject 2 --worker unknown -C "$tmp/work" test
 reject 2 --worker codex --access nonsense -C "$tmp/work" test
 reject 2 --worker claude -C "$HOME" test

@@ -1,6 +1,6 @@
 ---
 name: agent-worker-router
-description: Route explicit DeepSeek, Claude Code, or Codex worker requests from either host; Codex runs through the native Claude Code plugin runtime when it is installed.
+description: Route explicit DeepSeek, Claude Code, Codex, or Grok Build worker requests from either host; Codex runs through the native Claude Code plugin runtime when it is installed.
 ---
 
 # Agent worker router
@@ -15,6 +15,7 @@ Run adjacent `scripts/agent-worker-router` by its absolute installed path. It st
 | Claude Code → Codex, native agent | `codex:codex-rescue` only for in-session help that needs the user's **full Codex configuration** with MCP servers and plugins. Invoke Claude's `Agent` tool with `subagent_type: "codex:codex-rescue"` and a self-contained `--fresh` request; write `--effort <level>` / `--model <name>` in it, and explicitly request **read-only** (it defaults to write-capable work). It has no receipt, lease or `-C`, and its shared app-server broker keeps app-server and MCP processes alive after the call: on 2026-11-03 four such brokers, orphaned for 4–5 days, held 515 processes and ~2.9 GB resident. `/codex:review` suits a normal git diff review. |
 | Codex → Claude Code | Use `--worker claude`. Run from the Codex session with permission to reach the network and macOS Keychain; a sandbox blocking either makes the worker fail. |
 | Claude → Claude; Codex → Codex | Use the CLI runner for a fresh isolated worker. For in-session help, use the host's own subagents. |
+| Either host → Grok Build | Use `--worker grok` for a fresh read-only review. Install the official Grok Build CLI and run `grok login` first. |
 | Either host → DeepSeek | Always use `--worker deepseek` (Flash; `--pro` only on request). **Never use Codex `spawn_agent` with `agent_type: deepseek-worker`**: that legacy role can select `deepseek-flash` under a ChatGPT account and fail before work starts. |
 
 Choose the worker explicitly. Cross-provider calls may send the brief and readable workspace content to another service. Check data classification and get user direction before transferring private, personal, corporate, or production data. A filename denylist does not prove safety.
@@ -40,6 +41,12 @@ Full access calls adjacent `scripts/authorize-full` before taking a lease. Confi
 DeepSeek performs its own full authorization: full with a lease is supported only under an already configured allow policy; ask with a lease is refused (2) to avoid holding the lease during its dialog. Full without a lease retains its normal ask/allow behavior. Do not change policy just to bypass this restriction.
 
 DeepSeek uses isolated Claude Code configuration and your own API key in the macOS login Keychain. Copy the key locally and run `scripts/setup --from-clipboard` (clears the clipboard), or import with `scripts/setup --from-keychain SERVICE ACCOUNT`. Never put the key in chat, argv, a repository or a file. `scripts/setup --check` reports readiness without printing it. The key item deliberately allows `/usr/bin/security` without repeat prompts: **any same-user process can read it, and full-access DeepSeek can expose it to the model**. Full access requires informed consent.
+
+### Grok Build
+
+Use `--worker grok -C DIR --access read`. The router passes the brief in a private temporary file and removes it after the call. Only file reading, directory listing and search are offered to the CLI. Some Grok sessions ask to bind a local workspace before reading it. Headless mode declines this request. For a patch review, pipe a reviewed brief and diff into the router, using `-` as the brief argument. It requires Grok’s `minimal` sandbox. Use a clean directory if `grok inspect --json` finds hooks, plugins, MCP or LSP servers. Grok also needs access to its own login and runtime files. Use the normal browser login and provide only material approved for xAI. A CLI that cannot start its sandbox returns an error.
+
+Optional controls are `--model` and `--effort none|minimal|low|medium|high|xhigh|max`. Grok saves headless sessions locally. Each router call starts fresh. The receipt reflects the reported session ID, model and token counts. An interrupted response or a stop reason other than `end_turn` fails the call.
 
 ## Controls and defaults
 
@@ -78,9 +85,9 @@ A leased worker receives `AGENT_WORKER_ROUTER_LEASE_HELD`; `AGENT_WORKER_ROUTER_
 
 ## Results
 
-stdout contains only the answer; stderr contains diagnostics and exactly one `agent-worker-router: receipt ` compact JSON line after each Claude/Codex process runs, including failures/timeouts. No receipt follows validation errors, cached Claude limits, lease failures or nested refusal; DeepSeek retains its own summary.
+stdout contains only the answer; stderr contains diagnostics and exactly one `agent-worker-router: receipt ` compact JSON line after each Claude/Codex/Grok process runs, including failures/timeouts. No receipt follows validation errors, cached Claude limits, lease failures or nested refusal; DeepSeek retains its own summary.
 
-Receipts contain `worker, path, model, effort, provider, access, session, exit, duration_s, tokens, kept, requested, log`. `path` is `plugin` or `cli` (Claude and DeepSeek always `cli`). `duration_s` includes lease wait; `log` references the private Codex transcript, the plugin thread's rollout or Claude JSON. Codex effective fields come only from its banner on the CLI path and from the thread's rollout (`session_meta`, last `turn_context`, last `token_count`) on the plugin path; `access` maps the reported sandbox (`read-only` → read, `workspace-write` → edit, `danger-full-access` → full); tokens are `{"total":N}` when recognized. Claude model joins modelUsage keys, session/effort come from reported JSON, provider and access are unknown, tokens are `{"input":N,"output":N}` when both exist. Missing reports are the string `"unverified"`. Only `requested` contains resolved arguments (or null) and the requested access; **compare requested with effective values and treat unverified as unknown**. Codex emits one warning per reported mismatch.
+Receipts contain `worker, path, model, effort, provider, access, session, exit, duration_s, tokens, kept, requested, log`. `path` is `plugin` or `cli` (Claude, DeepSeek and Grok always `cli`). `duration_s` includes lease wait; `log` references the private Codex transcript, the plugin thread's rollout or Claude JSON. Codex effective fields come only from its banner on the CLI path and from the thread's rollout (`session_meta`, last `turn_context`, last `token_count`) on the plugin path; `access` maps the reported sandbox (`read-only` → read, `workspace-write` → edit, `danger-full-access` → full); tokens are `{"total":N}` when recognized. Claude model joins modelUsage keys, session/effort come from reported JSON, provider and access are unknown, tokens are `{"input":N,"output":N}` when both exist. Missing reports are the string `"unverified"`. Only `requested` contains resolved arguments (or null) and the requested access; **compare requested with effective values and treat unverified as unknown**. Codex emits one warning per reported mismatch.
 
 `sed -n 's/^agent-worker-router: receipt //p' diagnostics.log` extracts receipts for `jq`.
 

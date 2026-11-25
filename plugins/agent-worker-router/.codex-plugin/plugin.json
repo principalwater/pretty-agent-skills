@@ -1,7 +1,7 @@
 {
   "name": "agent-worker-router",
-  "version": "0.7.0",
-  "description": "Route bounded tasks to fresh DeepSeek, Claude Code, or Codex workers.",
+  "version": "0.8.0",
+  "description": "Route bounded tasks to fresh DeepSeek, Claude Code, Codex, or Grok Build workers.",
   "author": {
     "name": "principalwater",
     "url": "https://github.com/principalwater"
@@ -12,7 +12,7 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Agent Worker Router",
-    "shortDescription": "Delegate to DeepSeek, Claude, or Codex",
+    "shortDescription": "Delegate to DeepSeek, Claude, Codex, or Grok",
     "longDescription": "Launch a fresh external worker with explicit access level without changing the host default model.",
     "developerName": "principalwater",
     "category": "Productivity",

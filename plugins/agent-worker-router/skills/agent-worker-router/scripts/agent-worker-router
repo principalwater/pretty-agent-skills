@@ -3,7 +3,7 @@
 set -euo pipefail
 umask 077
 
-usage() { print 'usage: agent-worker-router --worker deepseek|claude|codex -C DIR [--access read|edit|full] [--model MODEL] [--effort LEVEL] [--provider ID] [--via plugin|cli] [--pro] [--evidence FILE] [--timeout SEC] [--keep] [--resume SESSION_ID] [--lease FILE] [--lease-wait SEC] BRIEF|-'; }
+usage() { print 'usage: agent-worker-router --worker deepseek|claude|codex|grok -C DIR [--access read|edit|full] [--model MODEL] [--effort LEVEL] [--provider ID] [--via plugin|cli] [--pro] [--evidence FILE] [--timeout SEC] [--keep] [--resume SESSION_ID] [--lease FILE] [--lease-wait SEC] BRIEF|-'; }
 die() { print -u2 -- "agent-worker-router: $1"; exit ${2:-1}; }
 limit_time() { print -- "$(date -r "$1" '+%Y-%m-%d %H:%M %Z') (~$(( ($1 - $(date +%s) + 59) / 60 ))m)"; }
 
@@ -86,7 +86,7 @@ if [[ $access != full ]]; then
   [[ $dir != / && $dir != $home_real ]] || die '-C directory is too broad' 2
   # Code planted under the last three runs later outside any sandbox: Codex config, rules and hooks,
   # ~/.local/bin, launch agents.
-  for private in "$HOME/.ssh" "$HOME/.aws" "$HOME/.gnupg" "$HOME/.config" "$HOME/.claude" "$HOME/Library/Keychains" \
+  for private in "$HOME/.ssh" "$HOME/.aws" "$HOME/.gnupg" "$HOME/.grok" "$HOME/.config" "$HOME/.claude" "$HOME/Library/Keychains" \
                  "${CODEX_HOME:-$HOME/.codex}" "$HOME/.local" "$HOME/Library/LaunchAgents"; do
     private=${private:A}
     [[ $dir != $private && $dir != $private/* && $private != $dir/* ]] || die '-C directory includes private configuration' 2
@@ -97,13 +97,17 @@ case $worker in
   deepseek)
     (( ! model_given )) || die 'use --pro for DeepSeek; --model is not supported' 2
     (( ! effort_given && ! provider_given && ! keep )) || die '--effort, --provider, --keep and --resume are not supported for DeepSeek' 2 ;;
-  claude|codex)
+  claude|codex|grok)
     (( ! pro )) || die '--pro is only for DeepSeek' 2
     [[ -z $evidence ]] || die '--evidence currently supports DeepSeek only' 2
     whence -p jq > /dev/null || die 'jq not found' ;;
-  *) die 'unknown worker: expected deepseek, claude, or codex' 2 ;;
+  *) die 'unknown worker: expected deepseek, claude, codex, or grok' 2 ;;
 esac
-if [[ $worker == claude ]]; then
+if [[ $worker == grok ]]; then
+  [[ $access == read ]] || die 'Grok supports --access read only' 2
+  (( ! provider_given && ! keep )) || die '--provider, --keep and --resume are not supported for Grok' 2
+  efforts='none minimal low medium high xhigh max'
+elif [[ $worker == claude ]]; then
   efforts='low medium high xhigh max'
   (( ! provider_given )) || die '--provider is only for Codex' 2
 elif [[ $worker == codex ]]; then
@@ -206,7 +210,7 @@ if [[ $worker == codex ]]; then
     fi
     [[ -z $why || $via != plugin ]] || die "Codex plugin cannot run this call: $why" 1
   fi
-else
+elif [[ $worker == claude ]]; then
   config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
   if [[ -e $config ]]; then
     if defaults=$(jq -sce 'select(length == 1 and (.[0] | type == "object")) | .[0] | {model,effortLevel}' "$config" 2>/dev/null); then
@@ -293,8 +297,13 @@ emit_receipt() {
   elif jq -se 'length == 1 and (.[0] | type == "object")' "$out" >/dev/null 2>&1; then
     effective_model=$(jq -r '(.modelUsage // {}) | if type == "object" and length > 0 then keys | join(",") else "unverified" end' "$out")
     effective_effort=$(jq -r '.effort // "unverified"' "$out")
-    session=$(jq -r '.session_id // "unverified"' "$out")
-    tokens=$(jq -c 'try (if (.usage.input_tokens | type) == "number" and (.usage.output_tokens | type) == "number" then {input:.usage.input_tokens,output:.usage.output_tokens} else "unverified" end) catch "unverified"' "$out")
+    if [[ $worker == grok ]]; then
+      session=$(jq -r '.sessionId // "unverified"' "$out")
+      [[ $session == unverified ]] || kept=1
+    else
+      session=$(jq -r '.session_id // "unverified"' "$out")
+    fi
+    tokens=$(jq -c 'try (if .usage_is_incomplete != true and (.usage.input_tokens | type) == "number" and (.usage.output_tokens | type) == "number" then {input:.usage.input_tokens,output:.usage.output_tokens} else "unverified" end) catch "unverified"' "$out")
   fi
   case $sandbox in
     read-only) effective_access=read ;; workspace-write) effective_access=edit ;;
@@ -353,9 +362,35 @@ if [[ $worker == codex && $access != full ]]; then
     fi
   fi
 fi
+scripts_dir=${0:A:h}
 cd "$dir"
 rc=0
-if [[ $worker == claude ]]; then
+if [[ $worker == grok ]]; then
+  grok_bin=$(whence -p grok) || grok_bin="$HOME/.grok/bin/grok"
+  [[ -x $grok_bin && -f $grok_bin ]] || die 'Grok Build CLI not found; install the official CLI and run grok login'
+  args=()
+  [[ -z $model ]] || args+=(--model "$model")
+  [[ -z $effort ]] || args+=(--reasoning-effort "$effort")
+  for family in CLAUDE CURSOR; do
+    for source in AGENTS HOOKS MCPS RULES SKILLS; do worker_env+=("GROK_${family}_${source}_ENABLED=0"); done
+  done
+  # Grok reopens the prompt when it enters the Linux sandbox; a pipe is already at EOF.
+  run_tmp=$(mktemp -d "${TMPDIR:-/tmp}/agent-worker-grok.XXXXXX")
+  print -rn -- "$brief" > "$run_tmp/brief"
+  run_worker "$timeout" env -i "${worker_env[@]}" GROK_WORKFLOWS=0 GROK_STORAGE_MODE=local \
+      "$scripts_dir/grok-read" "$grok_bin" --prompt-file "$run_tmp/brief" "${args[@]}" </dev/null > "$out" || rc=$?
+  if [[ ! -s $launch_file ]]; then
+    (( rc != 76 )) || die "lease wait timed out: $lease" 76
+    die 'worker supervisor failed' 1
+  fi
+  ran=1
+  (( rc != 142 )) || die "timed out after ${timeout}s; partial JSON: $out" 124
+  (( rc == 0 )) || die "Grok failed (exit $rc): $out"
+  jq -ers '
+    select(length == 1) | .[0] | select(.stopReason == "end_turn" and .error == null)
+    | .text | strings | select(test("\\S"))
+  ' "$out" || die "Grok returned an incomplete answer: $out"
+elif [[ $worker == claude ]]; then
   claude_bin=$(whence -p claude) || die 'Claude Code CLI not found'
   # Agent hosts pass a socket as stdin and script(1) fails on it; it only needs a pty for the child.
   cli_help=$(env -i "${worker_env[@]}" /usr/bin/script -q /dev/null "$claude_bin" --help < /dev/null) || die 'could not inspect Claude Code CLI'

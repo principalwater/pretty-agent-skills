@@ -15,7 +15,7 @@
     },
     {
       "name": "agent-worker-router",
-      "description": "Route bounded tasks to DeepSeek, Claude Code, or Codex workers.",
+      "description": "Route bounded tasks to DeepSeek, Claude Code, Codex, or Grok Build workers.",
       "source": "./plugins/agent-worker-router",
       "category": "productivity"
     }

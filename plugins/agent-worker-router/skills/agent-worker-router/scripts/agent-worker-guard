@@ -1236,12 +1236,13 @@ def push_info(cmd, c, ctx):
         parts = [os.path.expanduser(p[0]) for p in parts]
         if cwd not in (None, TEMP) or parts and os.path.isabs(parts[0]):
             repo = os.path.realpath(os.path.join(cwd if cwd not in (None, TEMP) else "/", *parts))
-    branch, config, local_tags = None, {}, set()
+    branch, config, local_tags, config_read = None, {}, set(), False
     if repo:
         code, out = git_read(repo, settings, "symbolic-ref", "-q", "--short", "HEAD")
         branch = out.strip() if code == 0 else None
         if code in (0, 1):
             code, out = git_read(repo, settings, "config", "-z", "--list")
+            config_read = code == 0
             for entry in out.split("\0") if code == 0 else []:
                 key, _, value = entry.partition("\n")
                 config.setdefault(key, []).append(value)
@@ -1297,8 +1298,28 @@ def push_info(cmd, c, ctx):
         elif not dst.startswith("refs/") or dst.startswith("refs/heads/"):
             name = dst.replace("refs/heads/", "", 1)
             dests.add("*" if "*" in name else name)
-    cmd["push"] = {"dests": dests, "specs": specs, "tags": tags, "url": url, "repo": repo}
+    cmd["push"] = {"dests": dests, "specs": specs, "tags": tags, "url": url, "repo": repo,
+                   "scope_known": config_read and not true("submodule.recurse")
+                   and get("push.recursesubmodules").lower() in ("", "no", "false", "off", "0")}
     return cmd["push"]
+
+
+def approved_branch_push(scope, command, push):
+    """Owner-approved publication of explicit commit IDs to a branch namespace on one remote."""
+    if not isinstance(scope, dict) or not push or not push["scope_known"] or push["tags"]:
+        return False
+    url, prefix = scope.get("url"), scope.get("branch_prefix")
+    if not isinstance(url, str) or not isinstance(prefix, str) or not re.fullmatch(r"[A-Za-z0-9_-]+/", prefix):
+        return False
+    if push["url"] != url or not push["dests"] or not all(d.startswith(prefix) for d in push["dests"]):
+        return False
+    # Inspect the complete invocation. An implicit refspec, wrapper or additional operation still needs approval.
+    refspec = r"[0-9a-f]{40}:refs/heads/" + re.escape(prefix) + r"[A-Za-z0-9_./-]+"
+    match = re.fullmatch(r"git push (?:--atomic )?([A-Za-z0-9_][A-Za-z0-9_.-]*)(?: " + refspec + r")+", command)
+    if not match:
+        return False
+    code, out = git_read(push["repo"], [], "remote", "get-url", "--push", "--all", match.group(1))
+    return code == 0 and out.splitlines() == [url]
 
 
 def bash_rule(rule, cmd, c, ctx, script):
@@ -1341,6 +1362,8 @@ def bash_rule(rule, cmd, c, ctx, script):
                                                for option, wanted in rule["option_values_any"].items()):
         return False
     if "push_url_regex" in rule and not (push and re.search(rule["push_url_regex"], push["url"] or "")):
+        return False
+    if rule.get("id") == "git-push-public" and approved_branch_push(rule.get("approved_push"), ctx.get("command", ""), push):
         return False
     repo = os.path.realpath(os.path.join(ctx["cwd"] or "/", os.path.expanduser(values.get("-C", "."))))
     if "repo_name_any" in rule and not any(name in repo or push and name in f"{push['repo']} {push['url']}"
@@ -1713,6 +1736,7 @@ def decide_destructive(event, env, rules_path=RULES_FILE, rules=None):
         ctx = {"rules": rules, "cwd": event.get("cwd") or os.getcwd(), "vars": {}, "env": env, "roots": roots,
                "heads": set()}
         command = str(data.get("command") or "")
+        ctx["command"] = command
         hit = destructive_reason(command, ctx)
         if hit:
             found, kind = (hit[0], " ".join(hit[1])[:200]), hit[2]
@@ -3020,6 +3044,29 @@ def selftest(rules_path=RULES_FILE):
                 if bool(got) != ask:
                     failures.append(f"git push in {where or '.'} {command[:90]!r}: expected {'ask' if ask else 'allow'}, "
                                     f"got {got}")
+            path = os.path.join(repos, "feature")
+            dest = "https://github.com/example/test.git"
+            git("-C", path, "config", "remote.origin.pushurl", dest)
+            git("-C", path, "config", "remote.other.url", dest.replace("example/", "other/"))
+            scope = {"url": dest, "branch_prefix": "codex/"}
+            public = {"id": "git-push-public", "why": "public remote", "command": ["git"], "sub": ["push"], "push_url_regex": r"github\.com",
+                      "approved_push": scope}
+            scoped_rules = dict(rules, bash=[public] + [r for r in rules["bash"] if r.get("id") != public["id"]])
+            ref = "1" * 40 + ":refs/heads/codex/topic"
+            def check_push(command, ask):
+                nonlocal total
+                total += 1
+                event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": path}
+                if bool(decide_destructive(event, {}, rules=scoped_rules)) != ask:
+                    failures.append(f"scoped public push: {command!r}, expected ask={ask}")
+            for args, ask in [(f"origin {ref}", False), (f"--atomic origin {ref} {ref}-2", False),
+                              (f"other {ref}", True), ("origin HEAD", True), (f"origin {ref} HEAD:main", True),
+                              (f"--force origin {ref}", True), (f"--tags origin {ref}", True),
+                              (f"origin +{ref}", True), ("origin :refs/heads/codex/topic", True),
+                              (f"origin {ref.replace('codex/', 'fix/')}", True)]:
+                check_push(f"git push {args}", ask)
+            git("-C", path, "config", "--add", "remote.origin.pushurl", dest.replace("example/", "other/"))
+            check_push(f"git push origin {ref}", True)
         finally:
             for key, value in saved_env.items():
                 if value is None:
